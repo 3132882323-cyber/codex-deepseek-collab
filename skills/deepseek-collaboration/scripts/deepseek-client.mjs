@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import { fileURLToPath } from 'node:url';
 
 const MAX_PROMPT_BYTES = 128 * 1024;
 const MAX_CONFIG_BYTES = 32 * 1024;
@@ -19,7 +20,7 @@ const DEFAULT_RETRY_BASE_MS = 1_000;
 const DEFAULT_RETRY_MAX_MS = 10_000;
 const MAX_DIAGNOSTIC_BYTES = 512 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
-const MODEL_ALIASES = ['flash'];
+const MODEL_ALIASES = ['flash', 'pro'];
 const TRUNCATED_REASONS = new Set(['length', 'max_tokens', 'max_output_tokens']);
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const TRANSPORT_CODES = new Set([
@@ -104,7 +105,7 @@ function parseArguments(argv) {
   }
   if (!options.promptFile) fail('invalid_argument', 'ask requires --prompt-file.');
   if (options.model && !MODEL_ALIASES.includes(options.model)) {
-    fail('invalid_argument', '--model must be flash.');
+    fail('invalid_argument', '--model must be flash or pro.');
   }
   if (!['disabled', 'enabled'].includes(options.thinking)) {
     fail('invalid_argument', '--thinking must be disabled or enabled.');
@@ -199,7 +200,8 @@ async function loadConfig(stateDir, optional = false) {
     fail('configuration_invalid', 'The credential source must be dpapi or env.');
   }
   if (!validateModel(raw.model) || !raw.models || typeof raw.models !== 'object' || Array.isArray(raw.models)
-      || !MODEL_ALIASES.every(alias => validateModel(raw.models[alias]))
+      || !validateModel(raw.models.flash)
+      || (Object.hasOwn(raw.models, 'pro') && !validateModel(raw.models.pro))
       || !MODEL_ALIASES.some(alias => raw.models[alias] === raw.model)) {
     fail('configuration_invalid', 'The configured DeepSeek models are invalid.');
   }
@@ -209,7 +211,7 @@ async function loadConfig(stateDir, optional = false) {
     allowed_origin: allowedOrigin.origin,
     protocol: 'openai',
     model: raw.model,
-    models: { flash: raw.models.flash },
+    models: { flash: raw.models.flash, ...(raw.models.pro ? { pro: raw.models.pro } : {}) },
     credential_source: credentialSource,
   };
 }
@@ -656,6 +658,13 @@ function diagnosticRequestId(value) {
     ? `sha256:${createHash('sha256').update(value).digest('hex').slice(0, 16)}` : null;
 }
 
+function diagnosticRequestFingerprint(raw, fingerprint) {
+  // The agent runtime supplies only its own fingerprint through this field.
+  if (typeof raw === 'string') return diagnosticRequestId(raw);
+  return typeof fingerprint === 'string' && /^sha256:[0-9a-f]{16}$/.test(fingerprint)
+    ? fingerprint : null;
+}
+
 async function recordDiagnostic(stateDir, action, model, result, promptPath) {
   const entry = {
     timestamp: new Date().toISOString(),
@@ -668,11 +677,11 @@ async function recordDiagnostic(stateDir, action, model, result, promptPath) {
     error_code: result.error_code ?? null,
     error_category: result.error_category ?? null,
     transport_code: result.transport_code ?? null,
-    request_id: diagnosticRequestId(result.request_id),
+    request_id: diagnosticRequestFingerprint(result.request_id, result.request_id_hash),
     attempt_history: Array.isArray(result.attempt_history) ? result.attempt_history.map(item => ({
       attempt: item.attempt, status: item.status, category: item.category,
       delay_ms: item.delay_ms, elapsed_ms: item.elapsed_ms,
-      request_id: diagnosticRequestId(item.request_id),
+      request_id: diagnosticRequestFingerprint(item.request_id, item.request_id_hash),
     })) : [],
   };
   const line = `${JSON.stringify(entry)}\n`;
@@ -733,7 +742,7 @@ let safeOutputOptions = null;
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.help) {
-    process.stdout.write('Usage:\n  deepseek-client.mjs [--state-dir PATH] status\n  deepseek-client.mjs [--state-dir PATH] models\n  deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [--model flash] [--thinking disabled|enabled] [--max-output-tokens 32..8192] [--timeout-ms N] [--total-timeout-ms N] [--max-attempts 1..3] [--retry-base-ms 1..10000] [--retry-max-ms 1..60000] [--output PATH] [--dry-run]\n\nask defaults: thinking disabled, 4096 generated tokens, 180000 ms per attempt, 360000 ms total, 3 attempts, 1000..10000 ms bounded retry wait, 128 KiB maximum UTF-8 input.\nOnly explicit HTTP 429/500/502/503/504 responses are retryable. A POST timeout or transport failure is never replayed.\nstatus and --dry-run never decrypt credentials or use the network.\n--dry-run only prints metadata and never writes an --output target.\n');
+    process.stdout.write('Usage:\n  deepseek-client.mjs [--state-dir PATH] status\n  deepseek-client.mjs [--state-dir PATH] models\n  deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [--model flash|pro] [--thinking disabled|enabled] [--max-output-tokens 32..8192] [--timeout-ms N] [--total-timeout-ms N] [--max-attempts 1..3] [--retry-base-ms 1..10000] [--retry-max-ms 1..60000] [--output PATH] [--dry-run]\n\nask defaults: thinking disabled, 4096 generated tokens, 180000 ms per attempt, 360000 ms total, 3 attempts, 1000..10000 ms bounded retry wait, 128 KiB maximum UTF-8 input.\nOnly explicit HTTP 429/500/502/503/504 responses are retryable. A POST timeout or transport failure is never replayed.\nstatus and --dry-run never decrypt credentials or use the network.\n--dry-run only prints metadata and never writes an --output target.\n');
     return;
   }
   if (options.action === 'ask' && options.output && !options.dryRun) {
@@ -773,7 +782,8 @@ async function main() {
           .filter(id => typeof id === 'string').map(id => redact(id, credential)))];
         return { ok: true, model_count: models.length, models,
           deepseek_models: models.filter(id => /deepseek/i.test(id)),
-          configured_models: { flash: redact(config.models.flash, credential) },
+          configured_models: Object.fromEntries(Object.entries(config.models)
+            .map(([alias, id]) => [alias, redact(id, credential)])),
           configured_model_present: models.includes(config.model) };
       });
     return;
@@ -782,6 +792,7 @@ async function main() {
   const prompt = decodeUtf8(buffer, 'prompt');
   if (!prompt.trim()) fail('prompt_empty', 'The prompt must contain text.');
   const model = options.model ? config.models[options.model] : config.model;
+  if (!model) fail('model_unavailable', 'The requested model alias is not configured.');
   if (options.dryRun) {
     await emitResult({
       ok: true,
@@ -812,12 +823,16 @@ async function main() {
   }, options, data => generationResult(data, model, credential));
 }
 
-main().catch(async error => {
-  // Never print native exceptions, subprocess stderr, response bodies, or stacks.
-  const result = errorResult(error);
-  if (safeOutputOptions) await emitResult(result, safeOutputOptions, process.stderr);
-  else {
-    process.stderr.write(`${JSON.stringify(result, null, 2)}\n`);
-    process.exitCode = 1;
-  }
-});
+if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+  main().catch(async error => {
+    // Never print native exceptions, subprocess stderr, response bodies, or stacks.
+    const result = errorResult(error);
+    if (safeOutputOptions) await emitResult(result, safeOutputOptions, process.stderr);
+    else {
+      process.stderr.write(`${JSON.stringify(result, null, 2)}\n`);
+      process.exitCode = 1;
+    }
+  });
+}
+
+export { SafeError, loadConfig, loadCredential, request, recordDiagnostic, safeTransportCode };

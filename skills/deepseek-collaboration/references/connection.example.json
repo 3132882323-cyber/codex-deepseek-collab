@@ -3,6 +3,6 @@
   "allowed_origin": "https://api.deepseek.com",
   "protocol": "openai",
   "model": "deepseek-flash",
-  "models": { "flash": "deepseek-flash" },
+  "models": { "flash": "deepseek-flash", "pro": "deepseek-v4-pro" },
   "credential_source": "env"
 }

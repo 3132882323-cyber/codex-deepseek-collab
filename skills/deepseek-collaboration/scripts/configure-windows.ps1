@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BaseUrl,
     [Parameter(Mandatory = $true)][string]$Model,
+    [string]$ProModel,
     [string]$StateDir,
     [switch]$Force
 )
@@ -28,7 +29,8 @@ try {
         $BaseUrl -match '[?#]' -or $BaseUrl -ne $BaseUrl.Trim()) {
         throw 'The API base URL must be HTTPS without userinfo, query, or fragment.'
     }
-    if ($Model -cnotmatch '(?i)^deepseek[A-Za-z0-9._:-]{1,120}$') {
+    if ($Model -cnotmatch '(?i)^deepseek[A-Za-z0-9._:-]{1,120}$' -or
+        ($ProModel -and $ProModel -cnotmatch '(?i)^deepseek[A-Za-z0-9._:-]{1,120}$')) {
         throw 'The model must be a valid DeepSeek model ID.'
     }
 
@@ -41,12 +43,14 @@ try {
     if (-not $parsed.IsDefaultPort) { $origin += ":$($parsed.Port)" }
     $path = $parsed.AbsolutePath.TrimEnd('/')
     $normalizedBase = "$origin$path"
+    $models = [ordered]@{ flash = $Model }
+    if ($ProModel) { $models.pro = $ProModel }
     $connection = [ordered]@{
         base_url = $normalizedBase
         allowed_origin = $origin
         protocol = 'openai'
         model = $Model
-        models = [ordered]@{ flash = $Model }
+        models = $models
         credential_source = 'dpapi'
     }
 

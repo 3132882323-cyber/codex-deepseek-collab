@@ -1,0 +1,39 @@
+{
+  "description": "示例任务启动参数，仅用于说明配置文件结构；各任务可独立启动。不包含任何实测性能数据或执行结果声明。",
+  "jobs": [
+    {
+      "label": "flash-csv-cleanup",
+      "arguments": {
+        "model": "flash",
+        "task": "请读取输入文件 rows.json（JSON 数组，每项含 id、name、category）。将处理结果写入 cleaned.json，输出一个 JSON 对象，包含 rows 与 issues 两个字段。要求：1) 严格保留每行的 id 与原始顺序；2) name 去除首尾空白，但不要翻译或改动非 ASCII 字符（如中文保持原样）；3) 将 category 规范化为 Fruit、Furniture、Office、Stationery 之一，比较时忽略 ASCII 大小写差异；无法匹配任一类别的置为 null，并在 issues 中记录该项的 id 与原因；4) name 缺失（字段缺失、null 或去除首尾空白后为空字符串）时置为 null，并同样在 issues 中记录；5) 不要臆造数据，不要新增输入中不存在的行。issues 为数组，每项至少包含 id 与说明性文字。",
+        "files": [
+          {
+            "path": "rows.json",
+            "content": "[{\"id\": 1, \"name\": \"  Apple  \", \"category\": \"fruit\"}, {\"id\": 2, \"name\": \"笔记本，A5 \", \"category\": \"STATIONERY\"}, {\"id\": 3, \"name\": null, \"category\": \"Office\"}, {\"id\": 4, \"name\": \"Desk Lamp!\", \"category\": \"Lighting\"}, {\"id\": 5, \"name\": \"  书架（木制）\", \"category\": \"furniture\"}, {\"id\": 6, \"name\": \"  \", \"category\": \"  \"}]"
+          }
+        ],
+        "max_steps": 4,
+        "max_tool_calls": 6,
+        "total_timeout_ms": 180000,
+        "max_output_tokens": 2048
+      }
+    },
+    {
+      "label": "pro-evidence-notes",
+      "arguments": {
+        "model": "pro",
+        "task": "请读取输入文件 notes.md，其中包含若干条带稳定编号的简短笔记。将结构化的证据整理结果写入 evidence.json，输出一个 JSON 对象，包含 claims 数组。claims 中每一项应包含：quote（从笔记中原样摘录的简短文字）、claim（由该引文支持的一句表述）、source_id（引文所在笔记的编号）、uncertainty（说明该结论的不确定性或局限）。要求：1) 只依据 notes.md 的内容，不引入任何外部事实、常识补充或推测；2) 若某条拟提出的表述在笔记中找不到直接证据，不要编造引文，而应在相应项的 uncertainty 中明确说明缺少证据；3) 可对完全没有证据支撑的要点单独列出并显式标注证据缺失；4) 不要翻译或改写 quote 字段中的原文。",
+        "files": [
+          {
+            "path": "notes.md",
+            "content": "# 笔记\n\n## N1\n周一上午的例行同步会上，团队确认样品数量为 3 盒。\n\n## N2\n供应商表示新批次预计在下周到达，但未给出确切日期。\n\n## N3\n有同事提到温控记录表可能缺失两页，尚未核实。\n"
+          }
+        ],
+        "max_steps": 4,
+        "max_tool_calls": 6,
+        "total_timeout_ms": 180000,
+        "max_output_tokens": 2048
+      }
+    }
+  ]
+}

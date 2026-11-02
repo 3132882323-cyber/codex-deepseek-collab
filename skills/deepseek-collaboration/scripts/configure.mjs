@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { link, lstat, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 
-const usage = 'Usage: node configure.mjs --base-url HTTPS_URL --model DEEPSEEK_MODEL --credential-source env [--state-dir PATH] [--force]';
+const usage = 'Usage: node configure.mjs --base-url HTTPS_URL --model DEEPSEEK_MODEL --credential-source env [--pro-model DEEPSEEK_MODEL] [--state-dir PATH] [--force]';
 
 function reject(message) {
   throw new Error(message);
@@ -15,6 +15,7 @@ function optionsFrom(argv) {
   const options = {};
   const values = new Map([
     ['--base-url', 'baseUrl'], ['--model', 'model'],
+    ['--pro-model', 'proModel'],
     ['--credential-source', 'credentialSource'], ['--state-dir', 'stateDir'],
   ]);
   for (let i = 0; i < argv.length; i += 1) {
@@ -47,7 +48,8 @@ function connectionFrom(options) {
       || /[?#]/.test(options.baseUrl) || options.baseUrl !== options.baseUrl.trim()) {
     reject('The API base URL must be HTTPS without userinfo, query, or fragment.');
   }
-  if (!/^deepseek[A-Za-z0-9._:-]{1,120}$/i.test(options.model)) {
+  if (!/^deepseek[A-Za-z0-9._:-]{1,120}$/i.test(options.model)
+      || options.proModel !== undefined && !/^deepseek[A-Za-z0-9._:-]{1,120}$/i.test(options.proModel)) {
     reject('The model must be a valid DeepSeek model ID.');
   }
   base.pathname = base.pathname.replace(/\/+$/, '');
@@ -56,7 +58,7 @@ function connectionFrom(options) {
     allowed_origin: base.origin,
     protocol: 'openai',
     model: options.model,
-    models: { flash: options.model },
+    models: { flash: options.model, ...(options.proModel ? { pro: options.proModel } : {}) },
     credential_source: 'env',
   };
 }

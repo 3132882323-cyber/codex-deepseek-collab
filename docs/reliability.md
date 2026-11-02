@@ -6,7 +6,7 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `connection.json` | 明确指定 HTTPS `base_url`、相同 origin 的 `allowed_origin`、`openai` 协议、准确模型及 `flash` 别名、凭据来源 |
+| `connection.json` | 明确指定 HTTPS `base_url`、相同 origin 的 `allowed_origin`、`openai` 协议、准确模型及 `flash` / 可选 `pro` 别名、凭据来源 |
 | `credential.dpapi` | 仅 Windows DPAPI 方式使用的密文，不能公开或跨设备复用 |
 | `diagnostics.jsonl` | 最多约 512 KiB 的安全操作元数据，轮转保留一份 previous 文件 |
 
@@ -26,7 +26,7 @@ deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [options]
 
 | ask 参数 | 默认值 / 取值 |
 | --- | --- |
-| `--model` | 默认配置的模型；可填别名 `flash` |
+| `--model` | 默认配置的模型；可填已配置的别名 `flash` / `pro` |
 | `--thinking` | `disabled` / `enabled`，默认 `disabled` |
 | `--max-output-tokens` | 默认 4096，范围 32–8192 |
 | `--timeout-ms` | 默认 180000，单次包括完整响应体的期限 |
@@ -37,7 +37,7 @@ deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [options]
 | `--output` | 可选，原子写入本次结果 JSON；父目录需已存在 |
 | `--dry-run` | 仅校验，不写 output |
 
-输入为 UTF-8 文本，最大 128 KiB；响应体最大 4 MiB。只发单条 user 消息，固定 `stream: false`，不提供工具调用执行器、会话持久化、图像输入或流式输出。thinking 开启时，推理和最终内容共享生成限制；只有最终 `message.content` 作为答案。
+CLI `ask` 输入为 UTF-8 文本，最大 128 KiB；响应体最大 4 MiB。此命令只发单条 user 消息，固定 `stream: false`，不提供工具调用执行器、会话持久化、图像输入或流式输出。thinking 开启时，推理和最终内容共享生成限制；只有最终 `message.content` 作为答案。MCP 智能体的工具循环、进程内会话和文件限制另见[智能体接口](../skills/deepseek-collaboration/references/agents.md)。
 
 ## 完整性与失败
 
@@ -46,6 +46,8 @@ deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [options]
 仅明确收到的 HTTP 429/500/502/503/504 可重试。尊重 `Retry-After` 秒数或日期，超过等待上限或剩余总预算则停止，不提前请求。网络中断、超时、损坏响应与输出截断不会自动重放。需要重新发起时先核实错误与任务状态，不套重试循环。任何重试都不保证服务商恰好只处理一次。
 
 结果包含 attempts、elapsed_ms、http_status、error_category、过滤后的 request_id 和 attempt_history；传输错误仅返回允许的短代码。诊断日志保存相同类别的元数据，请求 ID 在写日志前转为哈希。不保存原始错误消息、响应头、错误正文、提示词或答案。远端返回的模型、用量和请求标识仍属不可信数据。
+
+MCP 智能体的每轮 HTTP 操作以 `action: "agent_step"` 写入同一安全日志。这里的 `ok: true` 仅表示该轮请求返回，后续仍可能等待插件、被取消或因输出不完整而失败；整任务完成须检查 `state: "completed"` 并独立验收。HTTP 请求失败时，工具结果中的 `network` 仅返回 attempts、elapsed_ms、http_status、error_category 和允许的 transport_code，不回传原始请求标识或错误正文。缺少旧日志时不能事后推断某次失败的具体根因。
 
 安全校验后的输出目标会记录当前本地失败；非法参数、不安全目标或无法写入的路径可能只能返回非零退出码与 stderr JSON。读取旧输出时尤其需要检查本次退出码。输出不能覆盖提示词、配置、凭据或诊断日志，也不能通过符号链接或硬链接绕过这些检查。
 

@@ -1,6 +1,6 @@
 interface:
-  display_name: "DeepSeek 协作"
-  short_description: "按约一半工作量分配 Codex GPT 与 DeepSeek 的实质任务，并整合验证"
+  display_name: "DeepSeek 智能体协作"
+  short_description: "按约一半工作量调度 Flash 与 Pro 智能体，借助 Codex 插件并整合验收"
   default_prompt: "Use $deepseek-collaboration to divide substantial deliverables approximately equally between Codex GPT and DeepSeek, then integrate and validate them."
 
 policy:
