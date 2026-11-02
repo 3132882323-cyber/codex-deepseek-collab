@@ -223,11 +223,34 @@ test('stdio framing preserves split UTF-8 and recovers after malformed or oversi
   assert.equal(calls[0].args.task, task);
   const invalid = await connection.raw([Buffer.from([0xff, 0xfe])], value => value.error?.code === -32700);
   assert.equal(invalid.error.code, -32700);
-  const oversized = await connection.raw('X'.repeat(1024 * 1024 + 1), value => value.error?.code === -32700);
+  const oversizedFrame = JSON.stringify({jsonrpc:'2.0',id:92,method:'tools/call',params:{
+    name:'deepseek_agent_start',arguments:{model:'flash',task:'X'.repeat(16*1024*1024)}}});
+  const oversized = await connection.raw(oversizedFrame, value => value.error?.code === -32700);
   assert.equal(oversized.error.code, -32700);
   assert.deepEqual((await connection.rpc('ping')).result, {});
   assert.equal(calls.length, 1);
 });
+
+for (const [kind,content,count] of [
+  ['quotes','"'.repeat(1536*1024),2],
+  ['control characters','\u0001'.repeat(500*1024),3],
+]) {
+  test(`large completed results retain full artifacts across MCP framing: ${kind}`,async t=>{
+    const artifacts=Array.from({length:count},(_,index)=>({path:`part-${index}.txt`,content,sha256:'synthetic-hash'}));
+    const {runtime}=mockRuntime({start:async()=>({state:'completed',task_id:'synthetic-task',answer:'Done.',artifacts})});
+    const connection=inMemory(t,runtime);await initialize(connection);
+    const response=await connection.rpc('tools/call',{name:'deepseek_agent_start',arguments:{task:'synthetic',model:'flash'}});
+    const payload=toolPayload(response);
+    assert.equal(payload.state,'completed');
+    assert.equal(payload.answer,'Done.');
+    assert.equal(payload.artifacts.length,count);
+    for(const artifact of payload.artifacts){
+      assert.equal(artifact.content.length,content.length);
+      assert.ok(artifact.content===content,'artifact must arrive without truncation or escaping changes');
+    }
+    if(kind==='control characters')assert.ok(response.result.content[0].text.length<1000,'large-result text should direct clients to the complete structured result');
+  });
+}
 
 test('runtime errors are reported without raw credential, task, or provider details', async t => {
   const secret = 'sk-SYNTHETIC-MCP-ERROR-DO-NOT-EMIT';

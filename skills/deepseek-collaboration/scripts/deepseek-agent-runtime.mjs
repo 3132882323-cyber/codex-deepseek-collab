@@ -5,14 +5,22 @@ import { lstat, mkdir, mkdtemp, open, readdir, realpath, rename, unlink } from '
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { loadConfig, loadCredential, request, recordDiagnostic, safeTransportCode } from './deepseek-client.mjs';
+import { loadConfig, loadCredential, request, recordDiagnostic, safeTransportCode,
+  getModelCapabilities } from './deepseek-client.mjs';
 
 const KiB = 1024;
-const TASK_LIMIT = 128 * KiB;
-const FILE_LIMIT = 64 * KiB;
-const FILES_LIMIT = 128 * KiB;
-const HISTORY_LIMIT = 256 * KiB;
-const TOOL_RESULT_LIMIT = 64 * KiB;
+const MiB = KiB * KiB;
+// These are local byte budgets, not token estimates. A configured context window
+// enables the larger budgets; the provider still enforces its token window.
+const LEGACY_LIMITS = Object.freeze({ task: 128 * KiB, file: 64 * KiB,
+  files: 128 * KiB, history: 256 * KiB, toolResult: 64 * KiB, finalAnswer: 128 * KiB });
+const EXTENDED_LIMITS = Object.freeze({ task: 2 * MiB, file: 2 * MiB,
+  files: 4 * MiB, history: 16 * MiB, toolResult: 4 * MiB, finalAnswer: 2 * MiB });
+const MAX_OUTPUT_TOKENS = 393216;
+const REASONING_EFFORTS = new Set(['none', 'low', 'high', 'max']);
+const MAX_IMAGES = 4;
+const MAX_IMAGE_BYTES = 2 * MiB;
+const MAX_TOTAL_IMAGE_BYTES = 4 * MiB;
 const PLUGIN_TOOLS_LIMIT = 64 * KiB;
 const MAX_TASKS = 16;
 const MAX_FILES = 128;
@@ -22,7 +30,7 @@ const NETWORK_CATEGORIES = new Set(['timeout', 'cooldown', 'http_status', 'respo
 const SAFE_ERROR_CODES = new Set([
   'invalid_argument', 'invalid_state', 'task_not_found', 'runtime_disposed',
   'task_limit', 'deadline_exceeded', 'step_limit', 'tool_limit',
-  'http_attempt_limit', 'context_too_large', 'model_unavailable',
+  'http_attempt_limit', 'context_too_large', 'model_unavailable', 'model_capability_unavailable',
   'model_response_invalid', 'answer_incomplete', 'answer_truncated',
   'tool_call_invalid', 'tool_result_invalid', 'path_refused', 'file_unavailable',
   'file_too_large', 'file_limit', 'scratch_unavailable', 'runtime_failed',
@@ -170,18 +178,18 @@ async function allFiles(record) {
 async function readText(record, path) {
   const parts = validatePath(path);
   const details = await checkedFile(record, parts);
-  if (details.size > FILE_LIMIT) fail('file_too_large', 'The scratch file exceeds its byte limit.');
+  if (details.size > record.limits.file) fail('file_too_large', 'The scratch file exceeds its byte limit.');
   const target = pathFor(record, parts);
   let handle;
   try {
     handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
     const opened = await handle.stat();
-    if (!opened.isFile() || opened.nlink !== 1 || opened.size > FILE_LIMIT
+    if (!opened.isFile() || opened.nlink !== 1 || opened.size > record.limits.file
         || opened.ino !== details.ino || opened.dev !== details.dev) {
       fail('path_refused', 'The scratch file changed during the read.');
     }
     const data = await handle.readFile();
-    if (data.byteLength > FILE_LIMIT) fail('file_too_large', 'The scratch file exceeds its byte limit.');
+    if (data.byteLength > record.limits.file) fail('file_too_large', 'The scratch file exceeds its byte limit.');
     return new TextDecoder('utf-8', { fatal: true }).decode(data);
   } catch (error) {
     if (error instanceof AgentRuntimeError) throw error;
@@ -193,12 +201,12 @@ async function writeText(record, path, content) {
   const parts = validatePath(path);
   if (typeof content !== 'string') fail('tool_call_invalid', 'File content must be text.');
   const size = bytes(content);
-  if (size > FILE_LIMIT) fail('file_too_large', 'A scratch file exceeds its byte limit.');
+  if (size > record.limits.file) fail('file_too_large', 'A scratch file exceeds its byte limit.');
   await checkedDirectory(record, parts.slice(0, -1), true);
   const previous = await checkedFile(record, parts, true);
   const files = await allFiles(record);
   const used = files.reduce((sum, file) => sum + file.size, 0);
-  if (used - (previous?.size ?? 0) + size > FILES_LIMIT
+  if (used - (previous?.size ?? 0) + size > record.limits.files
       || !previous && files.length >= MAX_FILES) {
     fail('file_limit', 'The scratch file budget is exhausted.');
   }
@@ -256,13 +264,77 @@ function toolSpecs(pluginTools) {
   } });
   return specs;
 }
+const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
+  for (let bit = 0; bit < 8; bit++) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  return value >>> 0;
+});
+function crc32(data, start, end) {
+  let crc = 0xffffffff;
+  for (let index = start; index < end; index++) crc = CRC_TABLE[(crc ^ data[index]) & 255] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function validPng(data) {
+  if (data.length < 57 || !data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return false;
+  let offset = 8;
+  let hasHeader = false;
+  let hasPixels = false;
+  while (offset + 12 <= data.length) {
+    const length = data.readUInt32BE(offset);
+    if (length > data.length - offset - 12) return false;
+    const type = data.toString('ascii', offset + 4, offset + 8);
+    const end = offset + 8 + length;
+    if (!/^[A-Za-z]{4}$/.test(type) || crc32(data, offset + 4, end) !== data.readUInt32BE(end)) return false;
+    if (!hasHeader) {
+      if (type !== 'IHDR' || length !== 13 || data.readUInt32BE(offset + 8) === 0
+          || data.readUInt32BE(offset + 12) === 0) return false;
+      hasHeader = true;
+    } else if (type === 'IHDR') return false;
+    if (type === 'IDAT' && length > 0) hasPixels = true;
+    if (type === 'IEND') return length === 0 && hasPixels && end + 4 === data.length;
+    offset = end + 4;
+  }
+  return false;
+}
+function validImageBytes(mime, data) {
+  if (mime === 'image/png') return validPng(data);
+  if (mime === 'image/jpeg') return data.length >= 16 && data[0] === 255 && data[1] === 216
+    && data[2] === 255 && data.at(-2) === 255 && data.at(-1) === 217;
+  if (mime === 'image/gif') return data.length >= 14 && /^GIF8[79]a$/.test(data.toString('ascii', 0, 6))
+    && data.readUInt16LE(6) > 0 && data.readUInt16LE(8) > 0 && data.at(-1) === 59;
+  return data.length >= 20 && data.toString('ascii', 0, 4) === 'RIFF'
+    && data.readUInt32LE(4) === data.length - 8 && data.toString('ascii', 8, 12) === 'WEBP'
+    && ['VP8 ', 'VP8L', 'VP8X'].includes(data.toString('ascii', 12, 16));
+}
+function validateImages(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_IMAGES) fail('invalid_argument', 'Invalid explicit images.');
+  let total = 0;
+  return value.map(url => {
+    if (typeof url !== 'string' || url.length > Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 64) {
+      fail('invalid_argument', 'An explicit image exceeds its byte limit.');
+    }
+    const match = /^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$/.exec(url);
+    if (!match || match[2].length % 4 !== 0) fail('invalid_argument', 'Images require a supported base64 data URL.');
+    const data = Buffer.from(match[2], 'base64');
+    total += data.length;
+    if (!data.length || data.length > MAX_IMAGE_BYTES || total > MAX_TOTAL_IMAGE_BYTES
+        || data.toString('base64') !== match[2] || !validImageBytes(match[1], data)) {
+      fail('invalid_argument', 'An explicit image is invalid or exceeds its byte limit.');
+    }
+    return { url, bytes: data.length };
+  });
+}
 function validateStart(args) {
-  if (!plain(args) || typeof args.task !== 'string' || !args.task.trim() || bytes(args.task) > TASK_LIMIT
+  if (!plain(args) || typeof args.task !== 'string' || !args.task.trim() || bytes(args.task) > EXTENDED_LIMITS.task
       || !['flash', 'pro'].includes(args.model)) fail('invalid_argument', 'A bounded task and model alias are required.');
   const maxSteps = boundedInteger(args.max_steps, 'max_steps', 6, 1, 12);
   const maxToolCalls = boundedInteger(args.max_tool_calls, 'max_tool_calls', 12, 1, 32);
   const totalTimeoutMs = boundedInteger(args.total_timeout_ms, 'total_timeout_ms', 360_000, 1, 900_000);
-  const maxOutputTokens = boundedInteger(args.max_output_tokens, 'max_output_tokens', 4096, 32, 8192);
+  const maxOutputTokens = boundedInteger(args.max_output_tokens, 'max_output_tokens', 4096, 32, MAX_OUTPUT_TOKENS);
+  if (args.reasoning_effort !== undefined && !REASONING_EFFORTS.has(args.reasoning_effort)) {
+    fail('invalid_argument', 'Invalid reasoning_effort.');
+  }
+  const images = validateImages(args.images);
   const files = args.files ?? [];
   if (!Array.isArray(files) || files.length > MAX_FILES) fail('invalid_argument', 'Invalid input files.');
   const seenFiles = new Set();
@@ -274,7 +346,9 @@ function validateStart(args) {
     if (seenFiles.has(key)) fail('invalid_argument', 'Duplicate input file.');
     seenFiles.add(key);
     fileBytes += bytes(file.content);
-    if (bytes(file.content) > FILE_LIMIT || fileBytes > FILES_LIMIT) fail('file_limit', 'Input files exceed their byte limit.');
+    if (bytes(file.content) > EXTENDED_LIMITS.file || fileBytes > EXTENDED_LIMITS.files) {
+      fail('file_limit', 'Input files exceed their byte limit.');
+    }
   }
   const pluginTools = args.plugin_tools ?? [];
   if (!Array.isArray(pluginTools) || pluginTools.length > 32) fail('invalid_argument', 'Invalid plugin tool allowlist.');
@@ -291,8 +365,43 @@ function validateStart(args) {
     seenTools.add(tool.name);
   }
   safeJson(pluginTools, PLUGIN_TOOLS_LIMIT);
-  return { task: args.task, model: args.model, files, pluginTools, maxSteps, maxToolCalls,
-    totalTimeoutMs, maxOutputTokens };
+  return { task: args.task, model: args.model, files, images, pluginTools, maxSteps, maxToolCalls,
+    totalTimeoutMs, maxOutputTokens, reasoningEffort: args.reasoning_effort };
+}
+function initialMessages(input, credential) {
+  const clean = value => credential === undefined ? value : redactKnown(value, credential);
+  const catalog = clean(input.pluginTools.map(tool => ({ name: tool.name, description: tool.description,
+    input_schema: tool.input_schema ?? { type: 'object' } })));
+  return [
+    { role: 'system', content: 'You are a DeepSeek agent operating only in an isolated scratch directory. Use list_files, read_file, and write_file for files. Use codex_tool only for the explicitly allowlisted host tools. Never claim a tool ran unless its result was returned. Produce a final nonempty answer when finished. Allowed Codex host tools and their argument schemas: '
+      + JSON.stringify(catalog) },
+    { role: 'user', content: input.images.length
+      ? [{ type: 'text', text: clean(input.task) },
+        ...input.images.map(image => ({ type: 'image_url', image_url: { url: image.url } }))]
+      : clean(input.task) },
+  ];
+}
+function enforceInputLimits(input, limits, capabilities) {
+  if (bytes(input.task) > limits.task || input.maxOutputTokens > capabilities.max_output_tokens) {
+    fail('invalid_argument', 'The task or output limit exceeds the configured model budget.');
+  }
+  let total = 0;
+  for (const file of input.files) {
+    total += bytes(file.content);
+    if (bytes(file.content) > limits.file || total > limits.files) {
+      fail('file_limit', 'Input files exceed their byte limit.');
+    }
+  }
+  const vision = capabilities.vision;
+  if (input.images.length > Math.min(MAX_IMAGES, vision.max_images)
+      || input.images.some(image => image.bytes > Math.min(MAX_IMAGE_BYTES, vision.max_image_bytes))
+      || input.images.reduce((sum, image) => sum + image.bytes, 0)
+        > Math.min(MAX_TOTAL_IMAGE_BYTES, vision.max_total_image_bytes)) {
+    fail('invalid_argument', 'Explicit images exceed the configured model byte budget.');
+  }
+  // A vision-only profile can retain the legacy text/history budget. Check the
+  // actual initial message shape before credentials, including base64 overhead.
+  safeJson(initialMessages(input), limits.history, 'context_too_large');
 }
 function exactKeys(value, keys) {
   return plain(value) && Object.keys(value).every(key => keys.includes(key))
@@ -309,7 +418,7 @@ function validateToolCalls(record, rawCalls) {
     if (!plain(raw) || typeof raw.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(raw.id)
         || ids.has(raw.id) || record.seenCallIds.has(raw.id) || raw.type !== 'function'
         || !plain(raw.function) || typeof raw.function.name !== 'string'
-        || typeof raw.function.arguments !== 'string' || bytes(raw.function.arguments) > TOOL_RESULT_LIMIT) {
+        || typeof raw.function.arguments !== 'string' || bytes(raw.function.arguments) > record.limits.toolResult) {
       fail('tool_call_invalid', 'The model returned an invalid tool call.');
     }
     ids.add(raw.id);
@@ -331,11 +440,11 @@ function validateToolCalls(record, rawCalls) {
         fail('tool_call_invalid', 'Invalid write_file arguments.');
       }
       validatePath(args.path);
-      if (bytes(args.content) > FILE_LIMIT) fail('file_too_large', 'A scratch file exceeds its byte limit.');
+      if (bytes(args.content) > record.limits.file) fail('file_too_large', 'A scratch file exceeds its byte limit.');
     } else if (name === 'codex_tool') {
       if (!exactKeys(args, ['name', 'arguments']) || !record.pluginToolNames.has(args.name)
           || !plain(args.arguments)) fail('tool_call_invalid', 'The host tool is not allowlisted.');
-      safeJson(args.arguments, TOOL_RESULT_LIMIT, 'tool_call_invalid');
+      safeJson(args.arguments, record.limits.toolResult, 'tool_call_invalid');
     } else fail('tool_call_invalid', 'The model selected an unknown tool.');
     calls.push({ id: raw.id, name, args, raw });
   }
@@ -455,9 +564,7 @@ function checkActive(record) {
   return true;
 }
 function ensureHistory(record) {
-  if (bytes(safeJson(record.messages, HISTORY_LIMIT, 'context_too_large')) > HISTORY_LIMIT) {
-    fail('context_too_large', 'The conversation exceeds its byte limit.');
-  }
+  safeJson(record.messages, record.limits.history, 'context_too_large');
 }
 async function localTool(record, call) {
   let result;
@@ -471,12 +578,12 @@ async function localTool(record, call) {
   } else {
     result = await writeText(record, call.args.path, call.args.content);
   }
-  return safeJson(result, TOOL_RESULT_LIMIT, 'tool_result_invalid');
+  return safeJson(result, record.limits.toolResult, 'tool_result_invalid');
 }
 async function collectArtifacts(record) {
   const artifacts = [];
   const files = await allFiles(record);
-  if (files.reduce((sum, file) => sum + file.size, 0) > FILES_LIMIT) {
+  if (files.reduce((sum, file) => sum + file.size, 0) > record.limits.files) {
     fail('file_limit', 'The scratch file budget is exhausted.');
   }
   for (const file of files) {
@@ -488,8 +595,16 @@ async function collectArtifacts(record) {
   }
   return artifacts;
 }
-function assistantMessage(message) {
-  return { role: 'assistant', content: message.content ?? null, tool_calls: message.tool_calls };
+function assistantMessage(message, thinkingEnabled) {
+  if (thinkingEnabled && message.reasoning_content !== undefined && message.reasoning_content !== null
+      && typeof message.reasoning_content !== 'string') {
+    fail('model_response_invalid', 'The model returned invalid internal reasoning content.');
+  }
+  // Thinking tool continuations require the preceding assistant reasoning. Keep
+  // it only in provider-bound history; task views and diagnostics never use it.
+  return { role: 'assistant', content: message.content ?? null, tool_calls: message.tool_calls,
+    ...(thinkingEnabled && typeof message.reasoning_content === 'string'
+      ? { reasoning_content: message.reasoning_content } : {}) };
 }
 function toolMessage(id, content) { return { role: 'tool', tool_call_id: id, content }; }
 
@@ -558,10 +673,12 @@ export function createAgentRuntime(options = {}) {
         const policy = { timeoutMs: Math.max(1, Math.min(180_000, remaining)),
           totalTimeoutMs: Math.max(1, remaining),
           maxAttempts: Math.min(3, record.maxHttpAttempts - record.httpAttempts),
-          retryBaseMs: 1000, retryMaxMs: 10_000 };
+          retryBaseMs: 1000, retryMaxMs: 10_000, maxResponseBytes: record.maxResponseBytes };
         const body = { model: record.modelId, messages: record.messages, tools: record.tools,
           tool_choice: 'auto', max_tokens: record.maxOutputTokens,
-          thinking: { type: 'disabled' }, stream: false };
+          thinking: { type: record.reasoningEffort === 'none' ? 'disabled' : 'enabled' },
+          ...(record.reasoningEffort === 'none' ? {} : { reasoning_effort: record.reasoningEffort }),
+          stream: false };
         record.steps += 1;
         const stepStartedAt = Date.now();
         let response;
@@ -578,7 +695,7 @@ export function createAgentRuntime(options = {}) {
         record.httpAttempts += Math.max(1, Math.min(policy.maxAttempts,
           stepMetadata.attempts));
         if (!checkActive(record)) return view(record);
-        safeJson(response?.data, 4 * 1024 * KiB, 'model_response_invalid');
+        safeJson(response?.data, record.maxResponseBytes, 'model_response_invalid');
         const sanitized = redactKnown(response.data, record.credential);
         const choice = sanitized?.choices?.[0];
         const message = choice?.message;
@@ -596,8 +713,8 @@ export function createAgentRuntime(options = {}) {
           const cleanCalls = calls.map(call => ({ ...call.raw, function: {
             ...call.raw.function, arguments: JSON.stringify(call.args),
           } }));
-          const assistant = assistantMessage({ ...message, tool_calls: cleanCalls });
-          safeJson([...record.messages, assistant], HISTORY_LIMIT, 'context_too_large');
+          const assistant = assistantMessage({ ...message, tool_calls: cleanCalls }, record.reasoningEffort !== 'none');
+          safeJson([...record.messages, assistant], record.limits.history, 'context_too_large');
           record.messages.push(assistant);
           record.toolCalls += calls.length;
           for (const call of calls) record.seenCallIds.add(call.id);
@@ -629,7 +746,10 @@ export function createAgentRuntime(options = {}) {
           fail(finish === 'length' ? 'answer_truncated' : 'answer_incomplete',
             'The model did not return a complete final answer.');
         }
-        if (bytes(message.content) > TASK_LIMIT) fail('model_response_invalid', 'The final answer exceeds its byte limit.');
+        if (bytes(message.content) > record.limits.finalAnswer) fail('model_response_invalid', 'The final answer exceeds its byte limit.');
+        // Use the same internal representation for the final assistant turn.
+        // Terminal cleanup immediately releases this provider-only history.
+        record.messages.push(assistantMessage(message, record.reasoningEffort !== 'none'));
         record.artifacts = await collectArtifacts(record);
         if (!checkActive(record)) return view(record);
         record.answer = message.content;
@@ -661,6 +781,7 @@ export function createAgentRuntime(options = {}) {
       state: 'running', startedAt: Date.now(), deadlineAt: Date.now() + input.totalTimeoutMs,
       maxSteps: input.maxSteps, maxToolCalls: input.maxToolCalls,
       maxHttpAttempts: Math.min(18, input.maxSteps * 3), maxOutputTokens: input.maxOutputTokens,
+      limits: LEGACY_LIMITS, maxResponseBytes: 4 * MiB, reasoningEffort: 'none',
       steps: 0, toolCalls: 0, httpAttempts: 0, busy: true, cancelled: false,
       seenCallIds: new Set(), pluginToolNames: new Set(input.pluginTools.map(item => item.name)),
       tools: null, baseline: new Map(), pending: null,
@@ -668,6 +789,7 @@ export function createAgentRuntime(options = {}) {
       scratchDir: null, network: null };
     records.set(record.id, record);
     let unbind;
+    let rejectedInput = false;
     try {
       unbind = bindSignal(record, control);
       if (record.cancelled) { record.state = 'cancelled'; return view(record); }
@@ -676,6 +798,19 @@ export function createAgentRuntime(options = {}) {
       record.modelId = record.config?.models?.[input.model];
       if (typeof record.modelId !== 'string' || !record.modelId) {
         fail('model_unavailable', 'The requested model alias is not configured.');
+      }
+      const capabilities = getModelCapabilities(record.config, input.model);
+      record.limits = capabilities.context_window_tokens === null ? LEGACY_LIMITS : EXTENDED_LIMITS;
+      record.maxResponseBytes = capabilities.max_response_bytes;
+      if (input.images.length && (!capabilities.vision.enabled
+          || input.model === 'pro' && capabilities.vision.verified !== true)) {
+        fail('model_capability_unavailable', 'The requested model is not configured for explicit image input.');
+      }
+      try { enforceInputLimits(input, record.limits, capabilities); }
+      catch (error) { rejectedInput = true; throw error; }
+      record.reasoningEffort = input.reasoningEffort ?? record.config.default_reasoning_effort ?? 'none';
+      if (!REASONING_EFFORTS.has(record.reasoningEffort)) {
+        fail('configuration_invalid', 'The configured default reasoning effort is invalid.');
       }
       record.credential = await readCredential(record.config, stateDir);
       if (record.cancelled) { record.state = 'cancelled'; return view(record); }
@@ -702,16 +837,11 @@ export function createAgentRuntime(options = {}) {
         await writeText(record, file.path, content);
         record.baseline.set(file.path, hash(content));
       }
-      const catalog = redactKnown(input.pluginTools.map(tool => ({ name: tool.name, description: tool.description,
-        input_schema: tool.input_schema ?? { type: 'object' } })), record.credential);
-      record.messages = [
-        { role: 'system', content: 'You are a DeepSeek agent operating only in an isolated scratch directory. Use list_files, read_file, and write_file for files. Use codex_tool only for the explicitly allowlisted host tools. Never claim a tool ran unless its result was returned. Produce a final nonempty answer when finished. Allowed Codex host tools and their argument schemas: '
-          + JSON.stringify(catalog) },
-        { role: 'user', content: redactKnown(input.task, record.credential) },
-      ];
+      record.messages = initialMessages(input, record.credential);
       ensureHistory(record);
       return await drive(record);
     } catch (error) {
+      if (rejectedInput) { records.delete(record.id); throw error; }
       if (record.cancelled) { record.state = 'cancelled'; return view(record); }
       return markFailed(record, error);
     } finally { record.busy = false; unbind?.(); }
@@ -735,7 +865,7 @@ export function createAgentRuntime(options = {}) {
         fail('invalid_argument', 'A host tool result ID is unknown or duplicated.');
       }
       encoded.set(item.request_id, safeJson(redactKnown(item.result, record.credential),
-        TOOL_RESULT_LIMIT, 'tool_result_invalid'));
+        record.limits.toolResult, 'tool_result_invalid'));
     }
     if (expired(record)) return markFailed(record, new AgentRuntimeError('deadline_exceeded', 'The agent time limit was reached.'));
     const pending = record.pending;

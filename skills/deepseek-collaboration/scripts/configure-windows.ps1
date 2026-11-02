@@ -3,6 +3,9 @@ param(
     [Parameter(Mandatory = $true)][string]$BaseUrl,
     [Parameter(Mandatory = $true)][string]$Model,
     [string]$ProModel,
+    [string]$DefaultReasoningEffort,
+    [string]$ContextWindowTokens,
+    [string]$MaxOutputTokens,
     [string]$StateDir,
     [switch]$Force
 )
@@ -12,6 +15,8 @@ $safeMessages = @(
     'This setup requires Windows.',
     'The API base URL must be HTTPS without userinfo, query, or fragment.',
     'The model must be a valid DeepSeek model ID.',
+    'Invalid default reasoning effort.',
+    'Invalid capability limits.',
     'The state directory must be a regular directory.',
     'Configuration or credential already exists; use -Force to replace it.',
     'The API key must contain 1 to 8192 printable ASCII characters.'
@@ -33,6 +38,33 @@ try {
         ($ProModel -and $ProModel -cnotmatch '(?i)^deepseek[A-Za-z0-9._:-]{1,120}$')) {
         throw 'The model must be a valid DeepSeek model ID.'
     }
+    if ($PSBoundParameters.ContainsKey('DefaultReasoningEffort') -and
+        @('none', 'low', 'high', 'max') -cnotcontains $DefaultReasoningEffort) {
+        throw 'Invalid default reasoning effort.'
+    }
+    $context = $null
+    if ($PSBoundParameters.ContainsKey('ContextWindowTokens')) {
+        $parsedContext = [long]0
+        if ($ContextWindowTokens -cnotmatch '^\d+$' -or
+            -not [long]::TryParse($ContextWindowTokens, [ref]$parsedContext) -or
+            $parsedContext -lt 32 -or $parsedContext -gt 1048576) {
+            throw 'Invalid capability limits.'
+        }
+        $context = [int]$parsedContext
+    }
+    $output = $null
+    if ($PSBoundParameters.ContainsKey('MaxOutputTokens')) {
+        $parsedOutput = [long]0
+        if ($MaxOutputTokens -cnotmatch '^\d+$' -or
+            -not [long]::TryParse($MaxOutputTokens, [ref]$parsedOutput) -or
+            $parsedOutput -lt 32 -or $parsedOutput -gt 393216) {
+            throw 'Invalid capability limits.'
+        }
+        $output = [int]$parsedOutput
+    }
+    if ($null -ne $context -and $null -ne $output -and $output -gt $context) {
+        throw 'Invalid capability limits.'
+    }
 
     $hostPart = if ($parsed.HostNameType -eq [System.UriHostNameType]::IPv6) {
         "[$($parsed.IdnHost)]"
@@ -45,6 +77,9 @@ try {
     $normalizedBase = "$origin$path"
     $models = [ordered]@{ flash = $Model }
     if ($ProModel) { $models.pro = $ProModel }
+    $profile = [ordered]@{}
+    if ($null -ne $context) { $profile.context_window_tokens = $context }
+    if ($null -ne $output) { $profile.max_output_tokens = $output }
     $connection = [ordered]@{
         base_url = $normalizedBase
         allowed_origin = $origin
@@ -52,6 +87,14 @@ try {
         model = $Model
         models = $models
         credential_source = 'dpapi'
+    }
+    if ($PSBoundParameters.ContainsKey('DefaultReasoningEffort')) {
+        $connection['default_reasoning_effort'] = $DefaultReasoningEffort
+    }
+    if ($profile.Count -gt 0) {
+        $capabilities = [ordered]@{ flash = $profile }
+        if ($ProModel) { $capabilities.pro = $profile }
+        $connection['capabilities'] = $capabilities
     }
 
     if (-not $StateDir) {
@@ -100,7 +143,7 @@ try {
     $configTemp = [System.IO.Path]::Combine($resolvedState, ".connection.$([guid]::NewGuid()).tmp")
     $credentialTemp = [System.IO.Path]::Combine($resolvedState, ".credential.$([guid]::NewGuid()).tmp")
     try {
-        [System.IO.File]::WriteAllText($configTemp, (($connection | ConvertTo-Json -Depth 4) + "`n"), $utf8)
+        [System.IO.File]::WriteAllText($configTemp, (($connection | ConvertTo-Json -Depth 5) + "`n"), $utf8)
         [System.IO.File]::WriteAllText($credentialTemp, ($protectedKey + "`n"), $utf8)
         [System.IO.File]::Move($credentialTemp, $credentialPath, [bool]$Force)
         [System.IO.File]::Move($configTemp, $configPath, [bool]$Force)

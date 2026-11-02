@@ -2,7 +2,7 @@
 // live acceptance checks. It never prints child output or request parameters.
 import { spawn } from 'node:child_process';
 
-const MAX_LINE_BYTES = 4 * 1024 * 1024;
+const MAX_LINE_BYTES = 64 * 1024 * 1024;
 const MAX_STDERR_BYTES = 32 * 1024;
 
 export class McpRpcError extends Error {

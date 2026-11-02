@@ -27,8 +27,9 @@ deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [options]
 | ask 参数 | 默认值 / 取值 |
 | --- | --- |
 | `--model` | 默认配置的模型；可填已配置的别名 `flash` / `pro` |
-| `--thinking` | `disabled` / `enabled`，默认 `disabled` |
-| `--max-output-tokens` | 默认 4096，范围 32–8192 |
+| `--thinking` | `disabled` / `enabled`；显式值覆盖配置默认，旧配置默认 `disabled` |
+| `--reasoning-effort` | `none` / `low` / `high` / `max`；缺省读取本地默认，矛盾的显式 thinking 参数会拒绝 |
+| `--max-output-tokens` | 默认 4096；按路由配置限制，旧配置最多 8192，绝对范围 32–393216 |
 | `--timeout-ms` | 默认 180000，单次包括完整响应体的期限 |
 | `--total-timeout-ms` | 默认 360000，请求及退避总预算，最多 900000 |
 | `--max-attempts` | 默认 3，范围 1–3，包含首次 |
@@ -37,7 +38,7 @@ deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [options]
 | `--output` | 可选，原子写入本次结果 JSON；父目录需已存在 |
 | `--dry-run` | 仅校验，不写 output |
 
-CLI `ask` 输入为 UTF-8 文本，最大 128 KiB；响应体最大 4 MiB。此命令只发单条 user 消息，固定 `stream: false`，不提供工具调用执行器、会话持久化、图像输入或流式输出。thinking 开启时，推理和最终内容共享生成限制；只有最终 `message.content` 作为答案。MCP 智能体的工具循环、进程内会话和文件限制另见[智能体接口](../skills/deepseek-collaboration/references/agents.md)。
+CLI `ask` 输入为 UTF-8 文本；旧配置最大 128 KiB、响应最大 4 MiB；配置有效上下文窗口后分别为 2 MiB 和 16 MiB。这些是本地字节限制。此命令只发单条 user 消息，固定 `stream: false`，不提供工具执行器、持久会话、图像输入或流式输出。thinking 开启时，推理和最终内容共享生成限制；只有最终 `message.content` 作为答案。MCP 智能体的图片、工具循环与文件限制另见[能力配置](capabilities.md)和[智能体接口](../skills/deepseek-collaboration/references/agents.md)。
 
 ## 完整性与失败
 

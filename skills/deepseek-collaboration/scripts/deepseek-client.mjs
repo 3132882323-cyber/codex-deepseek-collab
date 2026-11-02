@@ -9,9 +9,11 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 
 const MAX_PROMPT_BYTES = 128 * 1024;
+const EXTENDED_MAX_PROMPT_BYTES = 2 * 1024 * 1024;
 const MAX_CONFIG_BYTES = 32 * 1024;
 const MAX_CREDENTIAL_BYTES = 64 * 1024;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+const EXTENDED_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 180_000;
 const DEFAULT_TOTAL_TIMEOUT_MS = 360_000;
 const MAX_TOTAL_TIMEOUT_MS = 900_000;
@@ -20,6 +22,10 @@ const DEFAULT_RETRY_BASE_MS = 1_000;
 const DEFAULT_RETRY_MAX_MS = 10_000;
 const MAX_DIAGNOSTIC_BYTES = 512 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+const LEGACY_MAX_OUTPUT_TOKENS = 8192;
+const ABSOLUTE_MAX_OUTPUT_TOKENS = 393216;
+const MAX_CONTEXT_TOKENS = 1048576;
+const REASONING_EFFORTS = new Set(['none', 'low', 'high', 'max']);
 const MODEL_ALIASES = ['flash', 'pro'];
 const TRUNCATED_REASONS = new Set(['length', 'max_tokens', 'max_output_tokens']);
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
@@ -71,6 +77,7 @@ function parseArguments(argv) {
     ['--total-timeout-ms', 'totalTimeoutMs'], ['--max-attempts', 'maxAttempts'],
     ['--retry-base-ms', 'retryBaseMs'], ['--retry-max-ms', 'retryMaxMs'],
     ['--output', 'output'], ['--thinking', 'thinking'],
+    ['--reasoning-effort', 'reasoningEffort'],
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -110,9 +117,13 @@ function parseArguments(argv) {
   if (!['disabled', 'enabled'].includes(options.thinking)) {
     fail('invalid_argument', '--thinking must be disabled or enabled.');
   }
+  if (options.reasoningEffort !== undefined && !REASONING_EFFORTS.has(options.reasoningEffort)) {
+    fail('invalid_argument', '--reasoning-effort must be none, low, high, or max.');
+  }
+  options.thinkingExplicit = provided.has('thinking');
   options.promptFile = resolve(options.promptFile);
   if (options.output) options.output = resolve(options.output);
-  options.maxOutputTokens = parseInteger(String(options.maxOutputTokens), '--max-output-tokens', 32, 8192);
+  options.maxOutputTokens = parseInteger(String(options.maxOutputTokens), '--max-output-tokens', 32, ABSOLUTE_MAX_OUTPUT_TOKENS);
   options.timeoutMs = parseInteger(String(options.timeoutMs), '--timeout-ms', 1, MAX_TOTAL_TIMEOUT_MS);
   options.totalTimeoutMs = parseInteger(String(options.totalTimeoutMs), '--total-timeout-ms', 1, MAX_TOTAL_TIMEOUT_MS);
   options.maxAttempts = parseInteger(String(options.maxAttempts), '--max-attempts', 1, 3);
@@ -122,6 +133,20 @@ function parseArguments(argv) {
     fail('invalid_argument', '--retry-max-ms must be at least --retry-base-ms.');
   }
   return options;
+}
+
+function resolveReasoning(options, config) {
+  const effort = options.reasoningEffort ?? (options.thinkingExplicit
+    ? undefined : config.default_reasoning_effort);
+  let thinking = options.thinking;
+  if (effort !== undefined) {
+    const required = effort === 'none' ? 'disabled' : 'enabled';
+    if (options.thinkingExplicit && thinking !== required) {
+      fail('invalid_argument', '--thinking conflicts with --reasoning-effort.');
+    }
+    thinking = required;
+  }
+  return { thinking, effort };
 }
 
 async function readBoundedFile(path, maximum, kind, optional = false) {
@@ -160,6 +185,80 @@ function decodeUtf8(buffer, kind) {
 
 function validateModel(value) {
   return typeof value === 'string' && /^deepseek[A-Za-z0-9._:-]{1,120}$/i.test(value);
+}
+
+function plainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+function capabilityInteger(value, minimum, maximum) {
+  return Number.isSafeInteger(value) && value >= minimum && value <= maximum;
+}
+
+function parseCapabilities(raw, models) {
+  if (raw === undefined) return null;
+  if (!plainObject(raw) || Object.keys(raw).some(alias => !MODEL_ALIASES.includes(alias) || !models[alias])) {
+    fail('configuration_invalid', 'The model capabilities are invalid.');
+  }
+  const capabilities = {};
+  for (const [alias, value] of Object.entries(raw)) {
+    if (!plainObject(value) || Object.keys(value).some(key =>
+      !['context_window_tokens', 'max_output_tokens', 'vision'].includes(key))) {
+      fail('configuration_invalid', 'The model capabilities are invalid.');
+    }
+    const context = value.context_window_tokens;
+    const output = value.max_output_tokens;
+    if (context !== undefined && !capabilityInteger(context, 32, MAX_CONTEXT_TOKENS)
+        || output !== undefined && !capabilityInteger(output, 32, ABSOLUTE_MAX_OUTPUT_TOKENS)
+        || context !== undefined && output !== undefined && output > context) {
+      fail('configuration_invalid', 'The model capability limits are invalid.');
+    }
+    let vision;
+    if (value.vision !== undefined) {
+      const input = value.vision;
+      if (!plainObject(input) || Object.keys(input).some(key => ![
+        'enabled', 'verified', 'max_images', 'max_image_bytes', 'max_total_image_bytes',
+      ].includes(key)) || typeof input.enabled !== 'boolean'
+          || input.verified !== undefined && typeof input.verified !== 'boolean'
+          || input.max_images !== undefined && !capabilityInteger(input.max_images, 1, 4)
+          || input.max_image_bytes !== undefined && !capabilityInteger(input.max_image_bytes, 1, 32 * 1024 * 1024)
+          || input.max_total_image_bytes !== undefined
+            && !capabilityInteger(input.max_total_image_bytes, 1, 48 * 1024 * 1024)
+          || alias === 'pro' && input.enabled && input.verified !== true) {
+        fail('configuration_invalid', 'The model vision capability is invalid.');
+      }
+      vision = { enabled: input.enabled, verified: input.verified === true,
+        max_images: input.max_images ?? 4,
+        max_image_bytes: input.max_image_bytes ?? 2 * 1024 * 1024,
+        max_total_image_bytes: input.max_total_image_bytes ?? 4 * 1024 * 1024 };
+    }
+    capabilities[alias] = {
+      ...(context === undefined ? {} : { context_window_tokens: context }),
+      ...(output === undefined ? {} : { max_output_tokens: output }),
+      ...(vision === undefined ? {} : { vision }),
+    };
+  }
+  return capabilities;
+}
+
+export function getModelCapabilities(config, alias) {
+  if (!MODEL_ALIASES.includes(alias) || !config?.models?.[alias]) {
+    fail('model_unavailable', 'The requested model alias is not configured.');
+  }
+  const profile = parseCapabilities(config.capabilities, config.models)?.[alias];
+  const context = profile?.context_window_tokens ?? null;
+  return {
+    configured: profile !== undefined,
+    context_window_tokens: context,
+    max_output_tokens: Math.min(profile?.max_output_tokens ?? LEGACY_MAX_OUTPUT_TOKENS,
+      context ?? ABSOLUTE_MAX_OUTPUT_TOKENS),
+    max_prompt_bytes: context === null ? MAX_PROMPT_BYTES : EXTENDED_MAX_PROMPT_BYTES,
+    max_response_bytes: context === null ? MAX_RESPONSE_BYTES : EXTENDED_MAX_RESPONSE_BYTES,
+    vision: profile?.vision ?? { enabled: false, verified: false,
+      max_images: 4, max_image_bytes: 2 * 1024 * 1024,
+      max_total_image_bytes: 4 * 1024 * 1024 },
+  };
 }
 
 async function loadConfig(stateDir, optional = false) {
@@ -205,6 +304,11 @@ async function loadConfig(stateDir, optional = false) {
       || !MODEL_ALIASES.some(alias => raw.models[alias] === raw.model)) {
     fail('configuration_invalid', 'The configured DeepSeek models are invalid.');
   }
+  if (raw.default_reasoning_effort !== undefined
+      && !REASONING_EFFORTS.has(raw.default_reasoning_effort)) {
+    fail('configuration_invalid', 'The default reasoning effort is invalid.');
+  }
+  const capabilities = parseCapabilities(raw.capabilities, raw.models);
   base.pathname = base.pathname.replace(/\/+$/, '');
   return {
     base_url: base.href.replace(/\/$/, ''),
@@ -213,6 +317,9 @@ async function loadConfig(stateDir, optional = false) {
     model: raw.model,
     models: { flash: raw.models.flash, ...(raw.models.pro ? { pro: raw.models.pro } : {}) },
     credential_source: credentialSource,
+    ...(capabilities === null ? {} : { capabilities }),
+    ...(raw.default_reasoning_effort === undefined ? {}
+      : { default_reasoning_effort: raw.default_reasoning_effort }),
   };
 }
 
@@ -277,9 +384,9 @@ function endpoint(config, path) {
   return url;
 }
 
-async function readResponseJson(response) {
+async function readResponseJson(response, maximumBytes = MAX_RESPONSE_BYTES) {
   const declaredLength = response.headers.get('content-length');
-  if (declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > MAX_RESPONSE_BYTES) {
+  if (declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > maximumBytes) {
     cancelResponseBody(response);
     fail('response_too_large', 'The API response exceeded its byte limit.');
   }
@@ -292,7 +399,7 @@ async function readResponseJson(response) {
       const chunk = await reader.read();
       if (chunk.done) break;
       bytes += chunk.value.byteLength;
-      if (bytes > MAX_RESPONSE_BYTES) {
+      if (bytes > maximumBytes) {
         try { void reader.cancel()?.catch(() => {}); } catch { /* Keep the size error. */ }
         fail('response_too_large', 'The API response exceeded its byte limit.');
       }
@@ -413,6 +520,10 @@ function networkMetadata(startedAt, attempts, status, requestId, history, catego
 async function request(config, path, credential, body, policy) {
   const startedAt = performance.now();
   const target = endpoint(config, path);
+  const maximumResponseBytes = policy.maxResponseBytes ?? MAX_RESPONSE_BYTES;
+  if (![MAX_RESPONSE_BYTES, EXTENDED_MAX_RESPONSE_BYTES].includes(maximumResponseBytes)) {
+    fail('invalid_argument', 'Invalid response byte limit.');
+  }
   const headers = { Accept: 'application/json', Authorization: `Bearer ${credential}` };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const payload = body === undefined ? undefined : JSON.stringify(body);
@@ -448,7 +559,7 @@ async function request(config, path, credential, body, policy) {
         lastStatus = response.status;
         lastRequestId = safeRequestId(response.headers, credential, prompt);
         if (!response.ok) return null;
-        return await readResponseJson(response);
+        return await readResponseJson(response, maximumResponseBytes);
       }, attemptTimeout, () => cancelResponseBody(response));
 
       if (!response.ok) {
@@ -742,7 +853,7 @@ let safeOutputOptions = null;
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.help) {
-    process.stdout.write('Usage:\n  deepseek-client.mjs [--state-dir PATH] status\n  deepseek-client.mjs [--state-dir PATH] models\n  deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [--model flash|pro] [--thinking disabled|enabled] [--max-output-tokens 32..8192] [--timeout-ms N] [--total-timeout-ms N] [--max-attempts 1..3] [--retry-base-ms 1..10000] [--retry-max-ms 1..60000] [--output PATH] [--dry-run]\n\nask defaults: thinking disabled, 4096 generated tokens, 180000 ms per attempt, 360000 ms total, 3 attempts, 1000..10000 ms bounded retry wait, 128 KiB maximum UTF-8 input.\nOnly explicit HTTP 429/500/502/503/504 responses are retryable. A POST timeout or transport failure is never replayed.\nstatus and --dry-run never decrypt credentials or use the network.\n--dry-run only prints metadata and never writes an --output target.\n');
+    process.stdout.write('Usage:\n  deepseek-client.mjs [--state-dir PATH] status\n  deepseek-client.mjs [--state-dir PATH] models\n  deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [--model flash|pro] [--thinking disabled|enabled] [--reasoning-effort none|low|high|max] [--max-output-tokens 32..393216] [--timeout-ms N] [--total-timeout-ms N] [--max-attempts 1..3] [--retry-base-ms 1..10000] [--retry-max-ms 1..60000] [--output PATH] [--dry-run]\n\nask defaults: thinking disabled, 4096 generated tokens, 180000 ms per attempt, 360000 ms total, 3 attempts, 1000..10000 ms bounded retry wait. Legacy configurations allow 8192 maximum output tokens and 128 KiB UTF-8 prompts; configured capabilities may raise these limits.\nOnly explicit HTTP 429/500/502/503/504 responses are retryable. A POST timeout or transport failure is never replayed.\nstatus and --dry-run never decrypt credentials or use the network.\n--dry-run only prints metadata and never writes an --output target.\n');
     return;
   }
   if (options.action === 'ask' && options.output && !options.dryRun) {
@@ -766,6 +877,8 @@ async function main() {
       protocol: config?.protocol ?? null,
       model: config?.model ?? null,
       models: config?.models ?? null,
+      capabilities: config?.capabilities ?? null,
+      default_reasoning_effort: config?.default_reasoning_effort ?? null,
       network_used: false,
       credential_decrypted: false,
     }, options);
@@ -788,20 +901,29 @@ async function main() {
       });
     return;
   }
-  const buffer = await readBoundedFile(options.promptFile, MAX_PROMPT_BYTES, 'prompt');
+  const modelAlias = options.model ?? (config.models.pro === config.model
+    && config.models.flash !== config.model ? 'pro' : 'flash');
+  const profile = getModelCapabilities(config, modelAlias);
+  const model = config.models[modelAlias];
+  const maxOutputTokens = options.maxOutputTokens;
+  if (maxOutputTokens > profile.max_output_tokens) {
+    fail('invalid_argument', '--max-output-tokens exceeds the configured model limit.');
+  }
+  const { thinking, effort } = resolveReasoning(options, config);
+  const buffer = await readBoundedFile(options.promptFile, profile.max_prompt_bytes, 'prompt');
   const prompt = decodeUtf8(buffer, 'prompt');
   if (!prompt.trim()) fail('prompt_empty', 'The prompt must contain text.');
-  const model = options.model ? config.models[options.model] : config.model;
-  if (!model) fail('model_unavailable', 'The requested model alias is not configured.');
   if (options.dryRun) {
     await emitResult({
       ok: true,
       dry_run: true,
       model_requested: model,
       prompt_bytes: buffer.byteLength,
-      max_prompt_bytes: MAX_PROMPT_BYTES,
-      max_output_tokens: options.maxOutputTokens,
-      thinking: options.thinking,
+      max_prompt_bytes: profile.max_prompt_bytes,
+      max_response_bytes: profile.max_response_bytes,
+      max_output_tokens: maxOutputTokens,
+      thinking,
+      reasoning_effort: effort ?? null,
       timeout_ms: options.timeoutMs,
       total_timeout_ms: options.totalTimeoutMs,
       max_attempts: options.maxAttempts,
@@ -817,10 +939,12 @@ async function main() {
   await executeNetwork(options, 'ask', model, config, '/chat/completions', credential, {
     model,
     messages: [{ role: 'user', content: prompt }],
-    max_tokens: options.maxOutputTokens,
-    thinking: { type: options.thinking },
+    max_tokens: maxOutputTokens,
+    thinking: { type: thinking },
+    ...(effort === undefined ? {} : { reasoning_effort: effort }),
     stream: false,
-  }, options, data => generationResult(data, model, credential));
+  }, { ...options, maxResponseBytes: profile.max_response_bytes },
+  data => generationResult(data, model, credential));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

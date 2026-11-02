@@ -4,5 +4,23 @@
   "protocol": "openai",
   "model": "deepseek-flash",
   "models": { "flash": "deepseek-flash", "pro": "deepseek-v4-pro" },
-  "credential_source": "env"
+  "credential_source": "env",
+  "default_reasoning_effort": "none",
+  "capabilities": {
+    "flash": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 8192,
+      "vision": {
+        "enabled": true,
+        "max_images": 4,
+        "max_image_bytes": 2097152,
+        "max_total_image_bytes": 4194304
+      }
+    },
+    "pro": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 8192,
+      "vision": { "enabled": false }
+    }
+  }
 }

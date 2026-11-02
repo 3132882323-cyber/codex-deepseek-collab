@@ -30,6 +30,8 @@ MCP `tool_timeout_sec` 需覆盖任务上限：默认任务预算 360 秒时可�
 
 [agent-jobs.json](examples/agent-jobs.json) 提供 Flash 清洗与 Pro 证据整理的合成任务参数。让 Codex 读取其中各项 `arguments`，分别交给 `deepseek_agent_start`；它们可独立启动，返回的任务 ID 和工具请求须分别处理。参数是使用示例，不是执行记录。
 
+可按模型路由配置上下文、输出上限、视觉能力和默认思考强度。`default_reasoning_effort: "max"` 启用最高档；每次默认输出预算仍为 4096 tokens，长输出须明确提高。`images` 接收主控提供的图片 data URL，Flash 与 Pro 分别核对能力，不能因图片或失败自动换模型。旧配置沿用原有预算与关闭思考的默认行为。字段、图片协议及本地字节预算见[模型能力配置](docs/capabilities.md)。
+
 参考：[Codex MCP 文档](https://learn.chatgpt.com/docs/extend/mcp) · [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 
@@ -94,7 +96,7 @@ node skills/deepseek-collaboration/scripts/deepseek-client.mjs ask --prompt-file
 
 ## 调用可靠性
 
-默认非流式、thinking 关闭、输出上限 4096 tokens、每次请求 180 秒、请求操作总预算 360 秒。最多尝试 3 次（含首次），只重试明确收到的 HTTP `429/500/502/503/504`，采用有限指数退避和 jitter，并遵守 `Retry-After`；要求的等待超过上限或剩余预算时停止。
+默认非流式、每次输出预算 4096 tokens、每次请求 180 秒、请求操作总预算 360 秒；thinking 从本地默认配置或显式任务参数读取，旧配置默认关闭。最多尝试 3 次（含首次），只重试明确收到的 HTTP `429/500/502/503/504`，采用有限指数退避和 jitter，并遵守 `Retry-After`；要求的等待超过上限或剩余预算时停止。
 
 超时、传输中断、HTTP 200 的损坏响应、空答案、输出截断均不自动重放；认证、参数、模型错误也停止。不叠加业务重试循环。中转错误可能发生在上游已经处理之后，HTTP 重试也可能额外计费；只允许一次提交时使用 `--max-attempts 1`。
 

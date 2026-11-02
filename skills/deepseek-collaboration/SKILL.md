@@ -9,6 +9,8 @@ description: Use DeepSeek Flash/Pro to offload substantial divisible work that c
 
 调用前定义任务输入、输出与验收条件；仅复制获准外发的最小脱敏文件内容。准确模型来自本地 `models.flash` / `models.pro`，缺配置即停，不找别的密钥、网关或模型。详见 [智能体工具与插件中转](references/agents.md)。
 
+思考强度和模型能力从本地 `default_reasoning_effort`、`capabilities` 读取。保持用户指定的 `max` 默认；每任务输出按需要预算，不能把容量上限当作每次生成量。图片只使用明确获准提供的 data URL，检查所选路由的视觉能力；Pro 未明确验证前用于文本任务，不因图片或失败自动换模型。
+
 ## 路由原则
 - 优先使用已加载的 MCP 工具 `deepseek_agent_start/continue/status/cancel` 执行。工具是真实调用；MCP 未加载时不得声称已调用。
 - 文本-only 产出可明确选择现有 CLI `ask`；不要在 agent 失败后自动改发 `ask`。

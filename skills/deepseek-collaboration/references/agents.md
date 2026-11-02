@@ -1,6 +1,8 @@
 ## DeepSeek Agent 工具 API（参考）
 
-`deepseek_agent_start({task, model:'flash'|'pro', files?, plugin_tools?, max_steps?, max_tool_calls?, total_timeout_ms?, max_output_tokens?})` 创建任务并复制调用者明确提交的脱敏文件到新建 scratch。DeepSeek 内置工具 `list_files/read_file/write_file` 仅限该目录；不读任意工作区/凭据，不直接跑 shell。`codex_tool` 仅允许 parent 传入的 `plugin_tools` 名单。返回 `{state:'waiting_for_tools', task_id, requests:[{request_id, tool_name, arguments}]}` 时任务挂起。
+`deepseek_agent_start({task, model:'flash'|'pro', files?, images?, reasoning_effort?, plugin_tools?, max_steps?, max_tool_calls?, total_timeout_ms?, max_output_tokens?})` 创建任务并复制调用者明确提交的脱敏文件到新建 scratch。DeepSeek 内置工具 `list_files/read_file/write_file` 仅限该目录；不读任意工作区/凭据，不直接跑 shell。`codex_tool` 仅允许 parent 传入的 `plugin_tools` 名单。返回 `{state:'waiting_for_tools', task_id, requests:[{request_id, tool_name, arguments}]}` 时任务挂起。
+
+`reasoning_effort` 可为 `none/low/high/max`，缺省读取本地配置。`images` 为明确获准外发的图片 data URL 数组，只按所选路由声明的视觉能力接收；Pro 需额外明确验证。输出默认 4096，最大值取本地路由配置，未配置时最多 8192；绝对上限 393216。最高档工具循环会完整保留提供商要求的内部思考字段，但不向主控或日志暴露。
 
 parent 真实执行插件后调用 `deepseek_agent_continue({task_id, results:[{request_id, result}]})` 回传。结果 ID 必须全部对应当前一次性 pending；重放、未知、重复均拒绝。`deepseek_agent_status({task_id})` 只返回状态元数据。`deepseek_agent_cancel({task_id})` 阻止后续操作；在途网络可能仍在处理，cancelling 不等于撤销上游费用。
 
@@ -47,7 +49,7 @@ parent 真实执行插件后调用 `deepseek_agent_continue({task_id, results:[{
 
 ## 限额与本地配置
 
-默认 6 次模型步骤、12 次工具调用、每次生成 4096 tokens、单次网络请求 180 秒、全任务 360 秒。插件等待时间也计入任务 deadline。任务文本最多 128 KiB，单文件与单工具结果最多 64 KiB，文件合计最多 128 KiB，对话历史最多 256 KiB；UTF-8 字节限制可能比 schema 中字符数限制更严格。最多 16 个同时有效的任务，终态缓存会逐出旧条目。源文件和产物留在当前状态目录下的独立 scratch；这里是路径隔离，不是操作系统沙箱。
+默认 6 次模型步骤、12 次工具调用、每次生成 4096 tokens、单次网络请求 180 秒、全任务 360 秒。插件等待时间也计入 deadline。旧配置：任务文本 128 KiB、单文件与单工具结果 64 KiB、文件合计 128 KiB、历史 256 KiB。配置有效 context_window_tokens 后：任务/单文件 2 MiB、文件合计/单工具结果 4 MiB、历史 16 MiB、最终答案 2 MiB。图片最多 4 张、单张 2 MiB、合计 4 MiB，配置可降低。字节预算不代表精确 token 计数，输入与生成仍受上游上下文限制。MCP 入站 16 MiB、出站 64 MiB，大结果完整内容在 structuredContent，主控优先读取它。最多 16 个同时有效的任务，终态缓存逐出旧条目。源文件和产物留在独立 scratch；这是路径隔离，不是操作系统沙箱。
 
 连接配置必须含准确的 `models.flash` 和需要时的 `models.pro`，任务开始后固定模型。配置脚本支持 `--pro-model`，Windows 脚本对应 `-ProModel`。客户端不会根据失败自动选择另一模型。已知当前 API 密钥会在输入、响应和中转结果中脱敏；这不替代主控对其他秘密和个人信息的最小化处理。
 

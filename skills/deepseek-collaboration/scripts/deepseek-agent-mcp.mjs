@@ -4,31 +4,42 @@ import {resolve} from 'node:path';
 
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const FALLBACK_PROTOCOL = '2025-06-18';
-const MAX_LINE = 1024 * 1024;
+const MAX_INPUT_LINE = 16 * 1024 * 1024;
+const MAX_OUTPUT_LINE = 64 * 1024 * 1024;
+const MAX_DUPLICATED_RESULT = 8 * 1024 * 1024;
 const INTERNAL_ERROR = 'Internal error';
 
 const TOOLS = [
   {
     name: 'deepseek_agent_start',
     description:
-      'Run a bounded Flash or Pro external agent. It can edit its isolated scratch files and request allowed Codex plugin tools. Execute pending requests in the host and continue.',
+      'Run a bounded Flash or Pro external agent with text and optional explicit image data URLs. The configured model profile controls image, context and output capabilities. Execute pending allowed plugin requests in the host and continue.',
     inputSchema: {
       type: 'object',
       required: ['task', 'model'],
       additionalProperties: false,
       properties: {
-        task: {type: 'string', minLength: 1, maxLength: 65536},
+        task: {type: 'string', minLength: 1, maxLength: 2097152,
+          description: 'Task text. The runtime enforces UTF-8 byte budgets separately from the provider token window.'},
         model: {type: 'string', enum: ['flash', 'pro']},
+        images: {
+          type: 'array', maxItems: 4,
+          description: 'Explicit PNG, JPEG, WebP or GIF base64 data URLs only; no remote URLs or local paths. At most 2 MiB per image and 4 MiB total decoded image bytes, subject to the selected model profile.',
+          items: {type: 'string', maxLength: 2796268,
+            pattern: '^data:image/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$'},
+        },
+        reasoning_effort: {type: 'string', enum: ['none', 'low', 'high', 'max'],
+          description: 'Uses the configured default when omitted. none disables thinking; other levels enable it.'},
         files: {
           type: 'array',
-          maxItems: 64,
+          maxItems: 128,
           items: {
             type: 'object',
             required: ['path', 'content'],
             additionalProperties: false,
             properties: {
-              path: {type: 'string', maxLength: 240},
-              content: {type: 'string', maxLength: 65536},
+              path: {type: 'string', maxLength: 512},
+              content: {type: 'string', maxLength: 2097152},
             },
           },
         },
@@ -49,7 +60,8 @@ const TOOLS = [
         max_steps: {type: 'integer', minimum: 1, maximum: 12},
         max_tool_calls: {type: 'integer', minimum: 1, maximum: 32},
         total_timeout_ms: {type: 'integer', minimum: 1, maximum: 900000},
-        max_output_tokens: {type: 'integer', minimum: 32, maximum: 8192},
+        max_output_tokens: {type: 'integer', minimum: 32, maximum: 393216,
+          description: 'Defaults to 4096; must fit the selected profile cap. Legacy connections without an output profile retain an 8192 maximum.'},
       },
     },
     annotations: {readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true},
@@ -146,7 +158,11 @@ export function createMcpServer({runtime = createAgentRuntime(), input = process
   function write(obj) {
     if (closed || output.destroyed || output.writableEnded) return;
     try {
-      output.write(JSON.stringify(obj) + '\n');
+      const encoded = JSON.stringify(obj);
+      output.write((Buffer.byteLength(encoded, 'utf8') <= MAX_OUTPUT_LINE ? encoded : JSON.stringify({
+        jsonrpc: '2.0', id: validId(obj.id) ? obj.id : null,
+        error: {code: -32603, message: 'Response exceeds its byte limit'},
+      })) + '\n');
     } catch {}
   }
 
@@ -160,7 +176,12 @@ export function createMcpServer({runtime = createAgentRuntime(), input = process
 
   function textResult(value) {
     const isError = isObject(value) && value.state === 'failed';
-    return {content: [{type: 'text', text: JSON.stringify(value)}], structuredContent: value, isError};
+    const serialized = JSON.stringify(value);
+    // Keep the full result in structuredContent. Duplicating a large JSON result
+    // inside a JSON text block adds another escaping layer and can exceed a frame.
+    const text = Buffer.byteLength(serialized, 'utf8') <= MAX_DUPLICATED_RESULT
+      ? serialized : 'The complete result is available in structuredContent.';
+    return {content: [{type: 'text', text}], structuredContent: value, isError};
   }
 
   function handleMessage(msg) {
@@ -216,7 +237,7 @@ export function createMcpServer({runtime = createAgentRuntime(), input = process
       sendResult(id, {
         protocolVersion,
         capabilities: {tools: {}},
-        serverInfo: {name: 'codex-deepseek-collab', version: '0.2.0'},
+        serverInfo: {name: 'codex-deepseek-collab', version: '0.3.0'},
         instructions:
           'This server coordinates external Pro/Flash agents. Pending codex_tool requests are executed by the host under existing permission scopes; no credentials are transferred.',
       });
@@ -303,7 +324,7 @@ export function createMcpServer({runtime = createAgentRuntime(), input = process
         start = nl + 1;
         continue;
       }
-      if (bufferedBytes + piece.length > MAX_LINE) {
+      if (bufferedBytes + piece.length > MAX_INPUT_LINE) {
         pieces = [];
         bufferedBytes = 0;
         discarding = true;
