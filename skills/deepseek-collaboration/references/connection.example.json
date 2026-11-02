@@ -1,0 +1,8 @@
+{
+  "base_url": "https://api.deepseek.com",
+  "allowed_origin": "https://api.deepseek.com",
+  "protocol": "openai",
+  "model": "deepseek-flash",
+  "models": { "flash": "deepseek-flash" },
+  "credential_source": "env"
+}

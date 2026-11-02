@@ -1,0 +1,19 @@
+你是数据清洗分类器。只输出一个严格 JSON 对象，不要 Markdown、不要代码围栏、不要解释、不要额外字段。
+
+输出结构：{"rows":[{"id":整数,"name":字符串或null,"category":字符串或null}],"issues":[{"id":整数,"field":"name"或"category","code":"missing_value"或"unknown_category"}]}
+
+规则：
+1. 保留 ID 与原顺序；ID 输出整数。
+2. name 仅去首尾空白，再对 ASCII 英文单词做 Title Case（apple->Apple，PEN->Pen，Desk Lamp 不变）；非 ASCII 文本不得翻译或替换；空名称输出 null。
+3. category 去空白后不分大小写精确映射：fruit=>Fruit，furniture=>Furniture，office=>Office，stationery=>Stationery；未知输出 null，并在 issues 记录 id、field:"category"、code:"unknown_category"。
+4. 名称为空也在 issues 记录 id、field:"name"、code:"missing_value"。
+5. 所有 6 行都必须存在。不得输出 ok:true 或类似自造业务凭证。
+
+源数据（CSV）：
+ID,name,category
+1,  蓝莓  , fruit
+2,Desk Lamp,Office
+3,  apple,FRUIT
+4,chair , furniture
+5,   ,office
+6,PEN, Stationery

@@ -1,0 +1,18 @@
+# Local credentials, connections, prompts, and results never belong in Git.
+node_modules/
+.env
+.env.*
+!.env.example
+*.dpapi
+connection.json
+diagnostics*.jsonl
+*.log
+work/
+outputs/
+/result.json
+.state/
+.codex/
+.DS_Store
+Thumbs.db
+*.tgz
+*.zip

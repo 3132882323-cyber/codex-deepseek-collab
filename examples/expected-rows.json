@@ -1,0 +1,41 @@
+{
+  "rows": [
+    {
+      "id": 1,
+      "name": "蓝莓",
+      "category": "Fruit"
+    },
+    {
+      "id": 2,
+      "name": "Desk Lamp",
+      "category": "Office"
+    },
+    {
+      "id": 3,
+      "name": "Apple",
+      "category": "Fruit"
+    },
+    {
+      "id": 4,
+      "name": "Chair",
+      "category": "Furniture"
+    },
+    {
+      "id": 5,
+      "name": null,
+      "category": "Office"
+    },
+    {
+      "id": 6,
+      "name": "Pen",
+      "category": "Stationery"
+    }
+  ],
+  "issues": [
+    {
+      "id": 5,
+      "field": "name",
+      "code": "missing_value"
+    }
+  ]
+}

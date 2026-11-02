@@ -1,0 +1,39 @@
+{
+  "name": "codex-deepseek-collab",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A portable Codex skill and bounded OpenAI-compatible DeepSeek client.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/3132882323-cyber/codex-deepseek-collab.git"
+  },
+  "homepage": "https://github.com/3132882323-cyber/codex-deepseek-collab#readme",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node tests/offline.test.mjs",
+    "check": "node --check skills/deepseek-collaboration/scripts/deepseek-client.mjs && node --check skills/deepseek-collaboration/scripts/configure.mjs && node --check tests/offline.test.mjs"
+  },
+  "files": [
+    "ci/offline-tests.yml",
+    "skills/deepseek-collaboration/SKILL.md",
+    "skills/deepseek-collaboration/agents/openai.yaml",
+    "skills/deepseek-collaboration/scripts/deepseek-client.mjs",
+    "skills/deepseek-collaboration/scripts/configure.mjs",
+    "skills/deepseek-collaboration/scripts/configure-windows.ps1",
+    "skills/deepseek-collaboration/references/connection.example.json",
+    "tests/offline.test.mjs",
+    "README.md",
+    "AGENTS.example.md",
+    "examples/batch-cleanup.md",
+    "examples/prompt.txt",
+    "examples/expected-rows.json",
+    "examples/validate-result.mjs",
+    "docs/reliability.md",
+    "docs/workflows.md",
+    "LICENSE"
+  ]
+}
