@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { loadConfig, loadCredential, request, recordDiagnostic, safeTransportCode,
-  getModelCapabilities } from './deepseek-client.mjs';
+  safeStreamResponseReason, getModelCapabilities } from './deepseek-client.mjs';
 
 const KiB = 1024;
 const MiB = KiB * KiB;
@@ -18,6 +18,7 @@ const EXTENDED_LIMITS = Object.freeze({ task: 2 * MiB, file: 2 * MiB,
   files: 4 * MiB, history: 16 * MiB, toolResult: 4 * MiB, finalAnswer: 2 * MiB });
 const MAX_OUTPUT_TOKENS = 393216;
 const REASONING_EFFORTS = new Set(['none', 'low', 'high', 'max']);
+const TRANSPORT_MODES = new Set(['json', 'sse']);
 const MAX_IMAGES = 4;
 const MAX_IMAGE_BYTES = 2 * MiB;
 const MAX_TOTAL_IMAGE_BYTES = 4 * MiB;
@@ -26,7 +27,9 @@ const MAX_TASKS = 16;
 const MAX_FILES = 128;
 const LOCAL_NAMES = new Set(['list_files', 'read_file', 'write_file']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
-const NETWORK_CATEGORIES = new Set(['timeout', 'cooldown', 'http_status', 'response', 'body', 'transport', 'ok']);
+const FINISH_REASONS = new Set(['stop', 'tool_calls', 'length', 'max_tokens',
+  'max_output_tokens', 'content_filter', 'function_call', 'insufficient_system_resource', 'aborted']);
+const NETWORK_CATEGORIES = new Set(['timeout', 'cooldown', 'http_status', 'response', 'body', 'transport', 'cancelled', 'ok']);
 const SAFE_ERROR_CODES = new Set([
   'invalid_argument', 'invalid_state', 'task_not_found', 'runtime_disposed',
   'task_limit', 'deadline_exceeded', 'step_limit', 'tool_limit',
@@ -37,7 +40,7 @@ const SAFE_ERROR_CODES = new Set([
   'configuration_invalid', 'configuration_unavailable', 'credential_unavailable',
   'credential_invalid', 'credential_decryption_failed', 'destination_refused',
   'platform_unsupported', 'api_http_error', 'retry_cooldown',
-  'retry_budget_exhausted', 'request_timeout', 'request_failed',
+  'retry_budget_exhausted', 'request_timeout', 'request_failed', 'request_cancelled',
   'response_too_large', 'response_invalid',
 ]);
 
@@ -63,6 +66,7 @@ function boundedInteger(value, name, fallback, low, high) {
   return value;
 }
 function hash(content) { return createHash('sha256').update(content, 'utf8').digest('hex'); }
+function artifactKey(path) { return process.platform === 'win32' ? path.toLowerCase() : path; }
 function redactKnown(value, credential, depth = 0) {
   if (depth > 32) fail('model_response_invalid', 'The model response is too deeply nested.');
   if (typeof value === 'string') return value.split(credential).join('[REDACTED]');
@@ -483,6 +487,7 @@ function stepErrorCode(error) {
   return typeof code === 'string' && SAFE_ERROR_CODES.has(code) ? code : 'runtime_failed';
 }
 function fallbackCategory(errorCode) {
+  if (errorCode === 'request_cancelled') return 'cancelled';
   if (errorCode === 'request_timeout' || errorCode === 'retry_budget_exhausted') return 'timeout';
   if (errorCode === 'retry_cooldown') return 'cooldown';
   if (errorCode === 'api_http_error') return 'http_status';
@@ -501,6 +506,7 @@ function safeStepMetadata(raw, errorCode, startedAt, credential) {
   const statusValue = ownValue(raw, 'http_status');
   const categoryValue = ownValue(raw, 'error_category');
   const transportCode = safeTransportCode({ code: ownValue(raw, 'transport_code') });
+  const responseReason = safeStreamResponseReason(ownValue(raw, 'response_reason'));
   const historyValue = ownValue(raw, 'attempt_history');
   const attemptHistory = Array.isArray(historyValue) ? historyValue.slice(0, 3).flatMap(item => {
     const attempt = ownValue(item, 'attempt');
@@ -523,6 +529,7 @@ function safeStepMetadata(raw, errorCode, startedAt, credential) {
     error_category: NETWORK_CATEGORIES.has(categoryValue) && categoryValue !== 'ok'
       ? categoryValue : fallbackCategory(errorCode),
     ...(transportCode ? { transport_code: transportCode } : {}),
+    ...(responseReason ? { response_reason: responseReason } : {}),
     request_id_hash: safeRequestFingerprint(ownValue(raw, 'request_id'), credential),
     attempt_history: attemptHistory,
   };
@@ -530,9 +537,21 @@ function safeStepMetadata(raw, errorCode, startedAt, credential) {
 function publicNetwork(metadata) {
   return { attempts: metadata.attempts, elapsed_ms: metadata.elapsed_ms,
     http_status: metadata.http_status, error_category: metadata.error_category,
-    ...(metadata.transport_code ? { transport_code: metadata.transport_code } : {}) };
+    ...(metadata.transport_code ? { transport_code: metadata.transport_code } : {}),
+    ...(metadata.response_reason ? { response_reason: metadata.response_reason } : {}) };
 }
-function elapsed(record) { return Math.max(0, Date.now() - record.startedAt); }
+function safeOutputMetadata(data) {
+  const choices = ownValue(data, 'choices');
+  const first = Array.isArray(choices) ? ownValue(choices, '0') : undefined;
+  const finish = ownValue(first, 'finish_reason');
+  const usage = ownValue(data, 'usage');
+  return {
+    finish_reason: FINISH_REASONS.has(finish) ? finish : null,
+    completion_tokens: safeCount(ownValue(usage, 'completion_tokens'), null),
+    reasoning_tokens: safeCount(ownValue(ownValue(usage, 'completion_tokens_details'), 'reasoning_tokens'), null),
+  };
+}
+function elapsed(record) { return Math.max(0, (record.finishedAt ?? Date.now()) - record.startedAt); }
 function metadata(record) {
   return { state: record.state, task_id: record.id, model: record.modelAlias,
     steps: record.steps, tool_calls: record.toolCalls, http_attempts: record.httpAttempts,
@@ -544,22 +563,29 @@ function view(record) {
     requests: record.pending.requests.map(item => ({ ...item })), artifacts: record.artifacts ?? [] };
   if (record.state === 'completed') return { ...base, answer: record.answer, artifacts: record.artifacts };
   if (record.state === 'failed') return { ...base, error_code: record.errorCode, error: record.error,
-    ...(record.network ? { network: record.network } : {}) };
+    artifacts: record.artifacts ?? [], ...(record.network ? { network: record.network } : {}) };
   return base;
 }
 function markFailed(record, error) {
   const safe = safeFailure(error);
   record.state = 'failed';
+  record.finishedAt ??= Date.now();
   record.errorCode = safe.code;
   record.error = safe.message;
   record.messages = null;
   record.pending = null;
   record.credential = null;
-  return view(record);
+}
+function markCancelled(record) {
+  record.state = 'cancelled';
+  record.finishedAt ??= Date.now();
+  record.pending = null;
+  record.messages = null;
+  record.credential = null;
 }
 function expired(record) { return Date.now() >= record.deadlineAt; }
 function checkActive(record) {
-  if (record.cancelled) { record.state = 'cancelled'; return false; }
+  if (record.cancelled) { markCancelled(record); return false; }
   if (expired(record)) { markFailed(record, new AgentRuntimeError('deadline_exceeded', 'The agent time limit was reached.')); return false; }
   return true;
 }
@@ -577,6 +603,9 @@ async function localTool(record, call) {
     result = { path: call.args.path, content: await readText(record, call.args.path) };
   } else {
     result = await writeText(record, call.args.path, call.args.content);
+    // Only a fully committed model write is eligible for failure recovery.
+    // Input copies and interrupted writes never enter this ledger.
+    record.writtenArtifacts.set(artifactKey(result.path), result.sha256);
   }
   return safeJson(result, record.limits.toolResult, 'tool_result_invalid');
 }
@@ -589,7 +618,36 @@ async function collectArtifacts(record) {
   for (const file of files) {
     const content = await readText(record, file.path);
     const digest = hash(content);
-    if (record.baseline.get(file.path) !== digest) {
+    if (record.baseline.get(artifactKey(file.path)) !== digest) {
+      artifacts.push({ path: file.path, content, sha256: digest });
+    }
+  }
+  return artifacts;
+}
+async function recoverArtifacts(record) {
+  if (!record.scratchDir || !record.writtenArtifacts.size) return [];
+  const root = await safeStat(record.scratchDir);
+  if (!root.isDirectory() || root.isSymbolicLink()
+      || await realpath(record.scratchDir) !== record.scratchDir) {
+    fail('path_refused', 'The scratch directory is unsafe.');
+  }
+  const files = await allFiles(record);
+  if (files.reduce((sum, file) => sum + file.size, 0) > record.limits.files) {
+    fail('file_limit', 'The scratch file budget is exhausted.');
+  }
+  const artifacts = [];
+  let recoveredBytes = 0;
+  for (const file of files) {
+    const key = artifactKey(file.path);
+    const expected = record.writtenArtifacts.get(key);
+    if (!expected || expected === record.baseline.get(key)) continue;
+    const content = await readText(record, file.path);
+    const digest = hash(content);
+    // Refuse partial or externally replaced content, even at an otherwise safe
+    // path. Recovery must not invent an artifact the agent did not commit.
+    if (digest === expected) {
+      recoveredBytes += bytes(content);
+      if (recoveredBytes > record.limits.files) fail('file_limit', 'The recovered artifact budget is exhausted.');
       artifacts.push({ path: file.path, content, sha256: digest });
     }
   }
@@ -620,16 +678,56 @@ export function createAgentRuntime(options = {}) {
   if (![readConfig, readCredential, sendRequest, writeDiagnostic].every(value => typeof value === 'function')) {
     fail('invalid_argument', 'Invalid runtime dependencies.');
   }
-  async function recordStep(record, ok, rawMetadata, error, startedAt) {
+  async function recordStep(record, ok, rawMetadata, error, startedAt, data) {
     const errorCode = ok ? null : stepErrorCode(error);
     let metadata;
     try { metadata = safeStepMetadata(rawMetadata, errorCode, startedAt, record.credential); }
     catch { metadata = safeStepMetadata(null, errorCode, startedAt, record.credential); }
+    let outputMetadata = {};
+    if (ok) {
+      try { outputMetadata = safeOutputMetadata(data); }
+      catch { outputMetadata = safeOutputMetadata(null); }
+    }
     try {
       await writeDiagnostic(stateDir, 'agent_step', record.modelAlias,
-        { ok, ...metadata, error_code: errorCode });
+        { ok, ...metadata, ...outputMetadata, transport_mode: record.transportMode, error_code: errorCode });
     } catch { /* Diagnostic failures cannot change the HTTP step outcome. */ }
     return metadata;
+  }
+  async function finish(record) {
+    if (!TERMINAL.has(record.state)) return;
+    record.finishedAt ??= Date.now();
+    // The promise is shared by status/cancel/dispose, so a task gets exactly one
+    // terminal log even when those methods overlap its original call.
+    record.finishing ??= Promise.resolve().then(async () => {
+      if (record.state === 'failed') {
+        try { record.artifacts = await recoverArtifacts(record); }
+        catch { record.artifacts = []; } // Never replace the original failure.
+      }
+      record.pending = null;
+      record.messages = null;
+      record.credential = null;
+      try {
+        await writeDiagnostic(stateDir, 'agent_task', record.modelAlias, {
+          ok: record.state === 'completed', state: record.state,
+          transport_mode: record.transportMode,
+          task_id_hash: `sha256:${hash(record.id).slice(0, 16)}`,
+          reasoning_effort: record.reasoningEffort, total_timeout_ms: record.totalTimeoutMs,
+          max_output_tokens: record.maxOutputTokens, max_steps: record.maxSteps,
+          max_tool_calls: record.maxToolCalls, max_http_attempts: record.maxHttpAttempts,
+          steps: record.steps, tool_calls: record.toolCalls, http_attempts: record.httpAttempts,
+          error_code: record.state === 'failed' ? record.errorCode : null,
+          ...(record.state === 'failed' && record.network?.response_reason
+            ? { response_reason: record.network.response_reason } : {}),
+          artifact_count: record.artifacts?.length ?? 0, elapsed_ms: elapsed(record),
+        });
+      } catch { /* Diagnostic failures cannot change the terminal task outcome. */ }
+    });
+    await record.finishing;
+  }
+  async function settledView(record) {
+    await finish(record);
+    return view(record);
   }
   const records = new Map();
   let disposed = false;
@@ -646,8 +744,9 @@ export function createAgentRuntime(options = {}) {
     const abort = () => {
       if (TERMINAL.has(record.state)) return;
       record.cancelled = true;
+      record.requestAbort.abort();
       record.state = record.busy ? 'cancelling' : 'cancelled';
-      if (!record.busy) { record.pending = null; record.messages = null; record.credential = null; }
+      if (!record.busy) { markCancelled(record); void finish(record); }
     };
     signal.addEventListener('abort', abort, { once: true });
     if (signal.aborted) abort();
@@ -665,7 +764,7 @@ export function createAgentRuntime(options = {}) {
     record.busy = true;
     try {
       while (true) {
-        if (!checkActive(record)) return view(record);
+        if (!checkActive(record)) return await settledView(record);
         if (record.steps >= record.maxSteps) fail('step_limit', 'The model step limit was reached.');
         if (record.httpAttempts >= record.maxHttpAttempts) fail('http_attempt_limit', 'The HTTP attempt limit was reached.');
         ensureHistory(record);
@@ -678,35 +777,39 @@ export function createAgentRuntime(options = {}) {
           tool_choice: 'auto', max_tokens: record.maxOutputTokens,
           thinking: { type: record.reasoningEffort === 'none' ? 'disabled' : 'enabled' },
           ...(record.reasoningEffort === 'none' ? {} : { reasoning_effort: record.reasoningEffort }),
-          stream: false };
+          stream: record.transportMode === 'sse',
+          ...(record.transportMode === 'sse' ? { stream_options: { include_usage: true } } : {}) };
         record.steps += 1;
         const stepStartedAt = Date.now();
         let response;
-        try { response = await sendRequest(record.config, '/chat/completions', record.credential, body, policy); }
+        try { response = await sendRequest(record.config, '/chat/completions', record.credential,
+          body, policy, { signal: record.requestAbort.signal }); }
         catch (error) {
           const stepMetadata = await recordStep(record, false, ownValue(error, 'metadata'), error, stepStartedAt);
           record.network = publicNetwork(stepMetadata);
-          record.httpAttempts += Math.max(1, Math.min(policy.maxAttempts,
-            stepMetadata.attempts));
-          if (record.cancelled) { record.state = 'cancelled'; return view(record); }
+          record.httpAttempts += Math.min(policy.maxAttempts, stepMetadata.attempts);
+          if (record.cancelled) { markCancelled(record); return await settledView(record); }
           throw error;
         }
-        const stepMetadata = await recordStep(record, true, ownValue(response, 'metadata'), null, stepStartedAt);
-        record.httpAttempts += Math.max(1, Math.min(policy.maxAttempts,
-          stepMetadata.attempts));
-        if (!checkActive(record)) return view(record);
+        const stepMetadata = await recordStep(record, true, ownValue(response, 'metadata'), null,
+          stepStartedAt, ownValue(response, 'data'));
+        record.httpAttempts += Math.min(policy.maxAttempts, stepMetadata.attempts);
+        if (!checkActive(record)) return await settledView(record);
         safeJson(response?.data, record.maxResponseBytes, 'model_response_invalid');
         const sanitized = redactKnown(response.data, record.credential);
         const choice = sanitized?.choices?.[0];
         const message = choice?.message;
         const finish = choice?.finish_reason;
+        const truncated = ['length', 'max_tokens', 'max_output_tokens'].includes(finish);
         if (!plain(message)) fail('model_response_invalid', 'The model returned an invalid response.');
         if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
           if (message.content !== null && message.content !== undefined
               && typeof message.content !== 'string') {
             fail('model_response_invalid', 'The model returned an invalid tool message.');
           }
-          if (!['tool_calls', 'stop'].includes(finish)) fail('answer_incomplete', 'The model did not complete its tool batch.');
+          if (!['tool_calls', 'stop'].includes(finish)) {
+            fail(truncated ? 'answer_truncated' : 'answer_incomplete', 'The model did not complete its tool batch.');
+          }
           const calls = validateToolCalls(record, message.tool_calls);
           // Preserve every call ID and function in the assistant turn. Arguments
           // are normalized only to remove a known credential echoed by a model.
@@ -721,7 +824,7 @@ export function createAgentRuntime(options = {}) {
           const results = new Map();
           const requests = [];
           for (const call of calls) {
-            if (!checkActive(record)) return view(record);
+            if (!checkActive(record)) return await settledView(record);
             if (call.name === 'codex_tool') {
               requests.push({ request_id: call.id, tool_name: call.args.name, arguments: call.args.arguments });
             } else {
@@ -731,7 +834,7 @@ export function createAgentRuntime(options = {}) {
           if (requests.length) {
             // The host must be able to review the exact files before a brokered check.
             record.artifacts = await collectArtifacts(record);
-            if (!checkActive(record)) return view(record);
+            if (!checkActive(record)) return await settledView(record);
             record.pending = { calls, results, requests };
             record.state = 'waiting_for_tools';
             return view(record);
@@ -743,7 +846,7 @@ export function createAgentRuntime(options = {}) {
           fail('model_response_invalid', 'The model returned an invalid tool list.');
         }
         if (finish !== 'stop' || typeof message.content !== 'string' || !message.content.trim()) {
-          fail(finish === 'length' ? 'answer_truncated' : 'answer_incomplete',
+          fail(truncated ? 'answer_truncated' : 'answer_incomplete',
             'The model did not return a complete final answer.');
         }
         if (bytes(message.content) > record.limits.finalAnswer) fail('model_response_invalid', 'The final answer exceeds its byte limit.');
@@ -751,16 +854,18 @@ export function createAgentRuntime(options = {}) {
         // Terminal cleanup immediately releases this provider-only history.
         record.messages.push(assistantMessage(message, record.reasoningEffort !== 'none'));
         record.artifacts = await collectArtifacts(record);
-        if (!checkActive(record)) return view(record);
+        if (!checkActive(record)) return await settledView(record);
         record.answer = message.content;
         record.state = 'completed';
+        record.finishedAt = Date.now();
         record.messages = null;
         record.credential = null;
-        return view(record);
+        return await settledView(record);
       }
     } catch (error) {
-      if (record.cancelled) { record.state = 'cancelled'; return view(record); }
-      return markFailed(record, error);
+      if (record.cancelled) markCancelled(record);
+      else markFailed(record, error);
+      return await settledView(record);
     } finally { record.busy = false; }
   }
 
@@ -770,8 +875,12 @@ export function createAgentRuntime(options = {}) {
     for (const record of records.values()) {
       if (record.state === 'waiting_for_tools' && !record.busy && expired(record)) {
         markFailed(record, new AgentRuntimeError('deadline_exceeded', 'The agent time limit was reached.'));
+        await finish(record);
       }
     }
+    // Terminal logging can yield; disposal during that await must still prevent
+    // a new record, credential read, or request from being created afterwards.
+    alive();
     while (records.size >= MAX_TASKS) {
       const terminalId = [...records].find(([, record]) => TERMINAL.has(record.state))?.[0];
       if (!terminalId) fail('task_limit', 'The runtime has reached its task limit.');
@@ -779,12 +888,15 @@ export function createAgentRuntime(options = {}) {
     }
     const record = { id: randomUUID(), modelAlias: input.model, modelId: null,
       state: 'running', startedAt: Date.now(), deadlineAt: Date.now() + input.totalTimeoutMs,
+      totalTimeoutMs: input.totalTimeoutMs, finishedAt: null, finishing: null,
       maxSteps: input.maxSteps, maxToolCalls: input.maxToolCalls,
       maxHttpAttempts: Math.min(18, input.maxSteps * 3), maxOutputTokens: input.maxOutputTokens,
       limits: LEGACY_LIMITS, maxResponseBytes: 4 * MiB, reasoningEffort: 'none',
+      transportMode: 'json',
       steps: 0, toolCalls: 0, httpAttempts: 0, busy: true, cancelled: false,
+      requestAbort: new AbortController(),
       seenCallIds: new Set(), pluginToolNames: new Set(input.pluginTools.map(item => item.name)),
-      tools: null, baseline: new Map(), pending: null,
+      tools: null, baseline: new Map(), writtenArtifacts: new Map(), pending: null,
       answer: null, artifacts: null, config: null, credential: null, messages: null,
       scratchDir: null, network: null };
     records.set(record.id, record);
@@ -792,9 +904,14 @@ export function createAgentRuntime(options = {}) {
     let rejectedInput = false;
     try {
       unbind = bindSignal(record, control);
-      if (record.cancelled) { record.state = 'cancelled'; return view(record); }
+      if (record.cancelled) { markCancelled(record); return await settledView(record); }
       record.config = await readConfig(stateDir);
-      if (record.cancelled) { record.state = 'cancelled'; return view(record); }
+      if (record.cancelled) { markCancelled(record); return await settledView(record); }
+      record.transportMode = record.config?.transport_mode ?? 'json';
+      if (!TRANSPORT_MODES.has(record.transportMode)) {
+        record.transportMode = 'json';
+        fail('configuration_invalid', 'The configured transport mode is invalid.');
+      }
       record.modelId = record.config?.models?.[input.model];
       if (typeof record.modelId !== 'string' || !record.modelId) {
         fail('model_unavailable', 'The requested model alias is not configured.');
@@ -813,7 +930,7 @@ export function createAgentRuntime(options = {}) {
         fail('configuration_invalid', 'The configured default reasoning effort is invalid.');
       }
       record.credential = await readCredential(record.config, stateDir);
-      if (record.cancelled) { record.state = 'cancelled'; return view(record); }
+      if (record.cancelled) { markCancelled(record); return await settledView(record); }
       if (typeof record.credential !== 'string' || !record.credential) {
         fail('credential_unavailable', 'The credential is unavailable.');
       }
@@ -822,28 +939,29 @@ export function createAgentRuntime(options = {}) {
       }
       record.tools = toolSpecs(input.pluginTools);
       await mkdir(scratchRoot, { recursive: true, mode: 0o700 });
-      if (record.cancelled) { record.state = 'cancelled'; return view(record); }
+      if (record.cancelled) { markCancelled(record); return await settledView(record); }
       const rootDetails = await safeStat(scratchRoot);
       if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
         fail('scratch_unavailable', 'The scratch root is unsafe.');
       }
       const canonicalRoot = await realpath(scratchRoot);
-      if (record.cancelled) { record.state = 'cancelled'; return view(record); }
+      if (record.cancelled) { markCancelled(record); return await settledView(record); }
       record.scratchDir = await realpath(await mkdtemp(join(canonicalRoot, 'task-')));
-      if (record.cancelled) { record.state = 'cancelled'; return view(record); }
+      if (record.cancelled) { markCancelled(record); return await settledView(record); }
       for (const file of input.files) {
-        if (record.cancelled) { record.state = 'cancelled'; return view(record); }
+        if (record.cancelled) { markCancelled(record); return await settledView(record); }
         const content = redactKnown(file.content, record.credential);
         await writeText(record, file.path, content);
-        record.baseline.set(file.path, hash(content));
+        record.baseline.set(artifactKey(file.path), hash(content));
       }
       record.messages = initialMessages(input, record.credential);
       ensureHistory(record);
       return await drive(record);
     } catch (error) {
       if (rejectedInput) { records.delete(record.id); throw error; }
-      if (record.cancelled) { record.state = 'cancelled'; return view(record); }
-      return markFailed(record, error);
+      if (record.cancelled) markCancelled(record);
+      else markFailed(record, error);
+      return await settledView(record);
     } finally { record.busy = false; unbind?.(); }
   }
 
@@ -867,13 +985,16 @@ export function createAgentRuntime(options = {}) {
       encoded.set(item.request_id, safeJson(redactKnown(item.result, record.credential),
         record.limits.toolResult, 'tool_result_invalid'));
     }
-    if (expired(record)) return markFailed(record, new AgentRuntimeError('deadline_exceeded', 'The agent time limit was reached.'));
+    if (expired(record)) {
+      markFailed(record, new AgentRuntimeError('deadline_exceeded', 'The agent time limit was reached.'));
+      return await settledView(record);
+    }
     const pending = record.pending;
     record.busy = true;
     let unbind;
     try {
       unbind = bindSignal(record, control);
-      if (record.cancelled) { record.state = 'cancelled'; return view(record); }
+      if (record.cancelled) { markCancelled(record); return await settledView(record); }
       for (const call of pending.calls) {
         const content = pending.results.get(call.id) ?? encoded.get(call.id);
         record.messages.push(toolMessage(call.id, content));
@@ -890,6 +1011,7 @@ export function createAgentRuntime(options = {}) {
     if (record.state === 'waiting_for_tools' && expired(record)) {
       markFailed(record, new AgentRuntimeError('deadline_exceeded', 'The agent time limit was reached.'));
     }
+    await finish(record);
     return { ...metadata(record), ...(record.state === 'waiting_for_tools'
       ? { pending_requests: record.pending.requests.length } : {}),
     ...(record.state === 'failed' && record.network ? { network: record.network } : {}) };
@@ -898,25 +1020,31 @@ export function createAgentRuntime(options = {}) {
   async function cancel(args) {
     alive();
     const record = find(args?.task_id);
-    if (TERMINAL.has(record.state)) return metadata(record);
+    if (TERMINAL.has(record.state)) { await finish(record); return metadata(record); }
     record.cancelled = true;
+    record.requestAbort.abort();
     record.state = record.busy ? 'cancelling' : 'cancelled';
-    if (!record.busy) { record.pending = null; record.messages = null; record.credential = null; }
+    if (!record.busy) markCancelled(record);
+    await finish(record);
     return metadata(record);
   }
 
   async function dispose() {
     if (disposed) return;
     disposed = true;
+    const finishing = [];
     for (const record of records.values()) {
       if (!TERMINAL.has(record.state)) {
         record.cancelled = true;
+        record.requestAbort.abort();
         record.state = record.busy ? 'cancelling' : 'cancelled';
       }
       record.pending = null;
       if (!record.busy) { record.messages = null; record.credential = null; }
+      finishing.push(finish(record));
     }
     records.clear();
+    await Promise.all(finishing);
   }
   return { start, resume, status, cancel, dispose };
 }

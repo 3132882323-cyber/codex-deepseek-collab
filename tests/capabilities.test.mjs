@@ -246,8 +246,9 @@ test('tool continuation replays internal reasoning exactly without host or log e
     results: [{ request_id: waiting.requests[0].request_id, result: { value: 'synthetic' } }] }));
   assert.equal(finished.answer, 'Final synthetic answer.');
   assert.equal(ctx.calls.length, 2);
-  assert.equal(diagnostics.length, 2);
-  assert.deepEqual(diagnostics.map(item => item.action), ['agent_step', 'agent_step']);
+  assert.equal(diagnostics.length, 3);
+  assert.deepEqual(diagnostics.map(item => item.action), ['agent_step', 'agent_step', 'agent_task']);
+  assert.equal(diagnostics.at(-1).result.state, 'completed');
   assert.doesNotMatch(JSON.stringify([waiting, finished, diagnostics]),
     /SYNTHETIC_(?:SECOND_)?INTERNAL_REASONING_SENTINEL/);
 });

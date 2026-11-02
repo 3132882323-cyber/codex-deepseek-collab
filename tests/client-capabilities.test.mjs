@@ -22,8 +22,17 @@ function fixture(t){
   const preload=join(root,'fetch-stub.mjs');
   writeFileSync(preload,`import {appendFileSync} from 'node:fs';
 globalThis.fetch=async (_url,init)=>{
-  appendFileSync(${JSON.stringify(capture)},JSON.stringify(JSON.parse(init.body))+'\\n');
-  return new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:'Safe answer.',reasoning_content:'SYNTHETIC-PRIVATE-REASONING'}}]}),{status:200,headers:{'content-type':'application/json'}});
+  const body=JSON.parse(init.body);
+  appendFileSync(${JSON.stringify(capture)},JSON.stringify(body)+'\\n');
+  const message={content:'Safe answer.',reasoning_content:'SYNTHETIC-PRIVATE-REASONING'};
+  if(body.stream){
+    const events=[{choices:[{index:0,delta:message,finish_reason:null}]},
+      {choices:[{index:0,delta:{},finish_reason:'stop'}]},
+      {choices:[],usage:{completion_tokens:24,completion_tokens_details:{reasoning_tokens:18}}}];
+    return new Response(events.map(value=>'data: '+JSON.stringify(value)+'\\n\\n').join('')+'data: [DONE]\\n\\n',
+      {status:200,headers:{'content-type':'text/event-stream'}});
+  }
+  return new Response(JSON.stringify({choices:[{finish_reason:'stop',message}]}),{status:200,headers:{'content-type':'application/json'}});
 };`);
   const run=(args=[],env={})=>spawnSync(process.execPath,['--import',pathToFileURL(preload).href,client,'--state-dir',state,'ask','--prompt-file',prompt,...args],
     {env:{...process.env,CODEX_HOME:root,DEEPSEEK_API_KEY:'SYNTHETIC-CLI-CAPABILITY-ONLY',...env},encoding:'utf8',timeout:10000,maxBuffer:1024*1024,windowsHide:true});
@@ -33,7 +42,7 @@ globalThis.fetch=async (_url,init)=>{
     assert.ok(rel&&!isAbsolute(rel)&&rel!=='..'&&!rel.startsWith('..'+sep)&&basename(actual).startsWith('deepseek-cli-capability-'));
     rmSync(actual,{recursive:true,force:true});
   });
-  return{connection,save,run,requests,prompt};
+  return{connection,save,run,requests,prompt,state};
 }
 function success(result){assert.equal(result.status,0,result.stderr);return JSON.parse(result.stdout);}
 function failure(result){assert.notEqual(result.status,0);return JSON.parse(result.stderr);}
@@ -45,7 +54,39 @@ test('CLI sends configured max reasoning with the ordinary per-task output budge
   assert.deepEqual(body.thinking,{type:'enabled'});
   assert.equal(body.reasoning_effort,'max');
   assert.equal(body.max_tokens,4096);
+  assert.equal(body.stream,false);
   assert.ok(!JSON.stringify(result).includes('SYNTHETIC-PRIVATE-REASONING'));
+});
+
+test('CLI explicit SSE configuration requests usage and writes safe protocol diagnostics',t=>{
+  const ctx=fixture(t);ctx.connection.transport_mode='sse';ctx.save();
+  const result=success(ctx.run());
+  assert.equal(result.answer,'Safe answer.');
+  assert.equal(result.transport_mode,'sse');
+  assert.equal(ctx.requests().length,1);
+  assert.equal(ctx.requests()[0].stream,true);
+  assert.deepEqual(ctx.requests()[0].stream_options,{include_usage:true});
+  assert.equal(ctx.requests()[0].reasoning_effort,'max');
+  const source=readFileSync(join(ctx.state,'diagnostics.jsonl'),'utf8');
+  const entry=JSON.parse(source.trim());
+  assert.equal(entry.model,'flash');
+  assert.equal(entry.transport_mode,'sse');
+  assert.equal(entry.finish_reason,'stop');
+  assert.equal(entry.completion_tokens,24);
+  assert.equal(entry.reasoning_tokens,18);
+  assert.ok(!source.includes('SYNTHETIC-PRIVATE-REASONING'));
+  assert.ok(!JSON.stringify(result).includes('SYNTHETIC-PRIVATE-REASONING'));
+});
+
+test('CLI SSE dry-run is local metadata and rejects invalid transport configuration before HTTP',t=>{
+  const ctx=fixture(t);ctx.connection.transport_mode='sse';ctx.save();
+  const result=success(ctx.run(['--dry-run'],{DEEPSEEK_API_KEY:''}));
+  assert.equal(result.transport_mode,'sse');
+  assert.equal(result.network_used,false);
+  assert.equal(ctx.requests().length,0);
+  ctx.connection.transport_mode='automatic';ctx.save();
+  assert.equal(failure(ctx.run([],{DEEPSEEK_API_KEY:''})).error_code,'configuration_invalid');
+  assert.equal(ctx.requests().length,0);
 });
 
 test('CLI passes the configured output ceiling and refuses a larger explicit request without replay',t=>{

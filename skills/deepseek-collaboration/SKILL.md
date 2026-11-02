@@ -1,6 +1,6 @@
 ---
 name: deepseek-collaboration
-description: Use DeepSeek Flash/Pro to offload substantial divisible work that can be isolated, delegated, and verified by GPT. Use when the task has clearly separable subtasks worth parallel or batch execution and the benefit outweighs integration/verification overhead. Not for trivial one-off work.
+description: Use DeepSeek Flash to offload substantial divisible work that can be isolated, delegated, and verified by GPT. Use when the task has clearly separable subtasks worth parallel or batch execution and the benefit outweighs integration/verification overhead. Not for trivial one-off work.
 ---
 
 # DeepSeek 智能体协作
@@ -9,12 +9,12 @@ description: Use DeepSeek Flash/Pro to offload substantial divisible work that c
 
 调用前定义任务输入、输出与验收条件；仅复制获准外发的最小脱敏文件内容。准确模型来自本地 `models.flash` / `models.pro`，缺配置即停，不找别的密钥、网关或模型。详见 [智能体工具与插件中转](references/agents.md)。
 
-思考强度和模型能力从本地 `default_reasoning_effort`、`capabilities` 读取。保持用户指定的 `max` 默认；每任务输出按需要预算，不能把容量上限当作每次生成量。图片只使用明确获准提供的 data URL，检查所选路由的视觉能力；Pro 未明确验证前用于文本任务，不因图片或失败自动换模型。
+思考强度和模型能力从本地 `default_reasoning_effort`、`capabilities` 读取。保持用户指定的 `max` 默认；每任务输出按需要预算，不能把容量上限当作每次生成量。推理与答案共享输出预算，长任务先拆成独立可验收文件、小批次交付，最终答复只列文件与校验摘要。预算不足时停止并记录，不自动加大预算重发。图片只使用明确获准提供的 data URL，检查所选路由的视觉能力，不因图片或失败自动换模型。
 
 ## 路由原则
 - 优先使用已加载的 MCP 工具 `deepseek_agent_start/continue/status/cancel` 执行。工具是真实调用；MCP 未加载时不得声称已调用。
 - 文本-only 产出可明确选择现有 CLI `ask`；不要在 agent 失败后自动改发 `ask`。
-- 由主控按任务选择模型并能解释原因。Flash 适合明确批处理；Pro 适合复杂定位；仅为初始策略，随任务评估调整。
+- 任务开始时明确选择 Flash。用户停用 Pro 时不得调用、恢复其配置或在失败后换到 Pro；只有用户明确重新启用且本机已配置时，才可选择 Pro。
 - 普通短任务直接做；批量先小样验证再分批，保留 ID/来源。明显依赖实时工具或隐私时偏离并说明。
 
 ## 插件中转与验收
@@ -25,6 +25,7 @@ description: Use DeepSeek Flash/Pro to offload substantial divisible work that c
 - 使用同一 MCP 进程与 `task_id` 继续，回传结果必须与本轮全部 `request_id` 一一对应。不同并行任务独立记账；失效、重复、未知 ID 不重新提交。
 - `completed` 只表示模型循环与交付完整。主控检查产物、来源、测试和用户要求后验收，模型自述测试通过不是运行证据。
 - 客户端只有限重试明确 HTTP 429/500/502/503/504，最多 3 次含首次并尊重 `Retry-After`。超时、传输中断、损坏响应、截断不自动重放，不叠加业务重试循环，不静默换模型。
+- 传输方式由本地 `transport_mode` 指定：`json` 或 `sse`，缺省 `json`。SSE 只在完整结束后交付；不完整流不会自动降级重发。每次网络成功不等于任务成功，检查 `agent_task` 终态及产物。失败任务返回的已写文件也须核对 SHA-256 并重新验收。
 
 ## 文本任务调用模板
 

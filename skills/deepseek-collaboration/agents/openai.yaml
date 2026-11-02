@@ -1,7 +1,7 @@
 interface:
   display_name: "DeepSeek 智能体协作"
-  short_description: "按约一半工作量调度 Flash 与 Pro 智能体，借助 Codex 插件并整合验收"
-  default_prompt: "Use $deepseek-collaboration to divide substantial deliverables approximately equally between Codex GPT and DeepSeek, then integrate and validate them."
+  short_description: "按约一半工作量调度 Flash 智能体，借助 Codex 插件并整合验收"
+  default_prompt: "Use $deepseek-collaboration with Flash to divide substantial deliverables approximately equally between Codex GPT and DeepSeek, then integrate and validate them."
 
 policy:
   allow_implicit_invocation: true

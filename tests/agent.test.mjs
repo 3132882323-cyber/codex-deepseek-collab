@@ -73,12 +73,12 @@ function fixture(t, plan, options = {}) {
     loadConfig: async () => { counters.configuration++; return structuredClone(config); },
     loadCredential: async () => { counters.credential++; return syntheticCredential; },
     ...(Object.hasOwn(options, 'recordDiagnostic') ? { recordDiagnostic: options.recordDiagnostic } : {}),
-    request: async (receivedConfig, endpoint, credential, body, policy) => {
+    request: async (receivedConfig, endpoint, credential, body, policy, control) => {
       assert.equal(receivedConfig.base_url, configuration.base_url);
       assert.equal(endpoint, '/chat/completions');
       assert.equal(credential, syntheticCredential);
       const index = calls.length;
-      calls.push({ body: structuredClone(body), policy: structuredClone(policy) });
+      calls.push({ body: structuredClone(body), policy: structuredClone(policy), signal: control?.signal });
       const step = typeof plan === 'function' ? plan(index, body, policy) : plan[index];
       assert.notEqual(step, undefined, 'the runtime must not make an unplanned provider request');
       return await step;
@@ -353,6 +353,131 @@ test('step budget is shared across broker continuation instead of resetting', as
   assert.equal(ctx.calls.length, 1);
 });
 
+for (const code of ['request_failed', 'step_limit', 'answer_truncated']) {
+  test(`failed tasks preserve committed changed artifacts without changing ${code}`, async t => {
+    const entries = [];
+    const ctx = fixture(t, index => {
+      if (index === 0) return toolResponse(
+        toolCall('call_new', 'write_file', { path: 'draft.txt', content: 'COMMITTED-NEW' }),
+        toolCall('call_changed', 'write_file', { path: 'input.txt', content: 'COMMITTED-CHANGED' }));
+      if (code === 'request_failed') throw Object.assign(new Error('SYNTHETIC-RAW-FAILURE'), { code });
+      const response = completion('SYNTHETIC-TRUNCATED-CONTENT');
+      response.data.choices[0].finish_reason = 'length';
+      return response;
+    }, { recordDiagnostic: async (_stateDir, action, model, result) => {
+      entries.push(structuredClone({ action, model, result }));
+    } });
+    const failed = isFailed(await ctx.runtime.start(baseInput({
+      task: 'SYNTHETIC-PRIVATE-RECOVERY-TASK', reasoning_effort: 'max',
+      max_steps: code === 'step_limit' ? 1 : 3,
+      files: [{ path: 'input.txt', content: 'ORIGINAL-INPUT' },
+        { path: 'untouched.txt', content: 'ORIGINAL-UNCHANGED' }],
+    })));
+    assert.equal(failed.error_code, code);
+    assert.equal(failed.answer, undefined);
+    assert.deepEqual(failed.artifacts, [
+      { path: 'draft.txt', content: 'COMMITTED-NEW',
+        sha256: createHash('sha256').update('COMMITTED-NEW').digest('hex') },
+      { path: 'input.txt', content: 'COMMITTED-CHANGED',
+        sha256: createHash('sha256').update('COMMITTED-CHANGED').digest('hex') },
+    ]);
+    const taskEntries = entries.filter(entry => entry.action === 'agent_task');
+    assert.equal(taskEntries.length, 1);
+    const task = taskEntries[0].result;
+    assert.deepEqual(Object.keys(task).sort(), ['ok', 'state', 'transport_mode', 'task_id_hash', 'reasoning_effort',
+      'total_timeout_ms', 'max_output_tokens', 'max_steps', 'max_tool_calls', 'max_http_attempts',
+      'steps', 'tool_calls', 'http_attempts', 'error_code', 'artifact_count', 'elapsed_ms'].sort());
+    assert.equal(task.state, 'failed');
+    assert.equal(task.error_code, code);
+    assert.equal(task.reasoning_effort, 'max');
+    assert.equal(task.artifact_count, 2);
+    assert.equal(task.http_attempts, ctx.calls.length);
+    assert.equal(task.task_id_hash, 'sha256:' + createHash('sha256').update(failed.task_id).digest('hex').slice(0, 16));
+    assert.doesNotMatch(JSON.stringify(entries), /SYNTHETIC-PRIVATE-RECOVERY-TASK|SYNTHETIC-RAW-FAILURE|COMMITTED-|ORIGINAL-|draft\.txt|input\.txt|untouched\.txt|SYNTHETIC-HIDDEN-REASONING|sk-SYNTHETIC-AGENT/);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.equal((await ctx.runtime.status({ task_id: failed.task_id })).elapsed_ms, failed.elapsed_ms);
+    assert.equal((await ctx.runtime.cancel({ task_id: failed.task_id })).elapsed_ms, failed.elapsed_ms);
+    assert.equal(entries.filter(entry => entry.action === 'agent_task').length, 1);
+    assert.equal(ctx.calls.length, code === 'step_limit' ? 1 : 2);
+  });
+}
+
+test('an earlier committed write survives a later local tool failure in the same batch', async t => {
+  const ctx = fixture(t, [toolResponse(
+    toolCall('call_write', 'write_file', { path: 'draft.txt', content: 'COMMITTED-DRAFT' }),
+    toolCall('call_missing', 'read_file', { path: 'missing.txt' }))]);
+  const failed = isFailed(await ctx.runtime.start(baseInput()));
+  assert.equal(failed.error_code, 'file_unavailable');
+  assert.equal(failed.artifacts[0]?.content, 'COMMITTED-DRAFT');
+  assert.equal(ctx.calls.length, 1);
+});
+
+test('Windows artifact recovery matches committed paths across directory casing and excludes baseline content', async t => {
+  if (process.platform !== 'win32') { t.skip('Directory casing equivalence is Windows-specific.'); return; }
+  for (const content of ['COMMITTED-CHANGED', 'ORIGINAL-INPUT']) {
+    const ctx = fixture(t, [toolResponse(
+      toolCall('call_write', 'write_file', { path: 'input/rows.txt', content }))]);
+    const failed = isFailed(await ctx.runtime.start(baseInput({ max_steps: 1,
+      files: [{ path: 'Input/rows.txt', content: 'ORIGINAL-INPUT' }] })));
+    assert.equal(failed.error_code, 'step_limit');
+    assert.deepEqual(failed.artifacts, content === 'ORIGINAL-INPUT' ? [] : [{
+      path: 'Input/rows.txt', content, sha256: createHash('sha256').update(content).digest('hex'),
+    }]);
+    assert.equal(ctx.calls.length, 1);
+  }
+});
+
+for (const kind of ['modified', 'oversized', 'total_budget', 'symlink', 'hardlink']) {
+  test(`failure recovery refuses ${kind} scratch contents and retains the original failure`, async t => {
+    const ctx = fixture(t, index => {
+      if (index === 0) return toolResponse(
+        toolCall('call_write', 'write_file', { path: 'draft.txt', content: 'COMMITTED-DRAFT' }),
+        toolCall('call_broker', 'codex_tool', { name: plugin.name, arguments: { key: 'prefix' } }));
+      throw Object.assign(new Error('Synthetic request failure.'), { code: 'request_failed' });
+    });
+    const waiting = await ctx.runtime.start(baseInput({ plugin_tools: [plugin] }));
+    assert.equal(waiting.artifacts[0]?.content, 'COMMITTED-DRAFT');
+    const draft = collectFiles(ctx.scratchRoot).find(path => basename(path) === 'draft.txt');
+    if (kind === 'modified') writeFileSync(draft, 'SYNTHETIC-UNCOMMITTED-CONTENT');
+    else if (kind === 'oversized') writeFileSync(draft, 'X'.repeat(64 * 1024 + 1));
+    else if (kind === 'total_budget') writeFileSync(join(dirname(draft), 'extra.txt'), 'X'.repeat(128 * 1024));
+    else {
+      const outside = join(ctx.base, 'outside-owned.txt');
+      writeFileSync(outside, 'SYNTHETIC-UNSHARED-LINK-CONTENT');
+      rmSync(draft);
+      try {
+        if (kind === 'hardlink') linkSync(outside, draft);
+        else symlinkSync(outside, draft, 'file');
+      } catch (error) {
+        if (['EPERM', 'EACCES', 'ENOTSUP', 'ENOSYS'].includes(error.code)) { t.skip('This filesystem does not permit test links.'); return; }
+        throw error;
+      }
+    }
+    const failed = isFailed(await ctx.runtime.resume({ task_id: waiting.task_id,
+      results: [{ request_id: waiting.requests[0].request_id, result: 'synthetic' }] }));
+    assert.equal(failed.error_code, 'request_failed', 'artifact inspection must not mask the provider failure');
+    assert.deepEqual(failed.artifacts, [], 'stale broker manifests and unsafe recovery contents must be discarded');
+    assert.doesNotMatch(JSON.stringify(failed), /SYNTHETIC-UNCOMMITTED-CONTENT|SYNTHETIC-UNSHARED-LINK-CONTENT/);
+    assert.equal(ctx.calls.length, 2);
+  });
+}
+
+for (const finish of ['length', 'max_tokens', 'max_output_tokens']) {
+  for (const shape of ['text', 'tools']) {
+    test(`${shape} output marked ${finish} is classified as answer_truncated`, async t => {
+      const response = shape === 'text' ? completion('Incomplete text.')
+        : toolResponse(toolCall('call_write', 'write_file', { path: 'partial.txt', content: 'MUST-NOT-WRITE' }));
+      response.data.choices[0].finish_reason = finish;
+      const ctx = fixture(t, [response]);
+      const failed = isFailed(await ctx.runtime.start(baseInput()));
+      assert.equal(failed.error_code, 'answer_truncated');
+      assert.deepEqual(failed.artifacts, []);
+      assert.equal(collectFiles(ctx.scratchRoot).length, 0);
+      assert.equal(ctx.calls.length, 1);
+    });
+  }
+}
+
 test('tool call budget rejects an entire over-budget batch before the first write', async t => {
   const ctx = fixture(t, [toolResponse(toolCall('call_one', 'write_file', { path: 'one.txt', content: 'one' }),
     toolCall('call_two', 'write_file', { path: 'two.txt', content: 'two' }))]);
@@ -408,11 +533,116 @@ test('in-flight cancellation is honest and prevents effects after a late provide
   await enteredRequest;
   const cancellation = await ctx.runtime.cancel({ task_id: waiting.task_id });
   assert.ok(['cancelling', 'cancelled'].includes(cancellation.state));
+  assert.ok(ctx.calls[1].signal instanceof AbortSignal);
+  assert.equal(ctx.calls[1].signal.aborted, true, 'cancellation must reach transport retry/backoff control');
+  assert.equal(ctx.calls[1].policy.signal, undefined, 'AbortSignal travels outside the serializable request policy');
   release(toolResponse(toolCall('call_late', 'write_file', { path: 'too-late.txt', content: 'must not write' })));
   assert.equal((await running).state, 'cancelled');
   assert.equal((await ctx.runtime.status({ task_id: waiting.task_id })).state, 'cancelled');
   assert.equal(ctx.calls.length, 2);
   assert.equal(collectFiles(ctx.scratchRoot).length, 0);
+});
+
+for (const cancellation of ['abort', 'dispose']) {
+  test(`${cancellation} propagates to an in-flight request and logs cancellation only after it settles`, async t => {
+    let release;
+    let entered;
+    const begun = new Promise(resolve => { entered = resolve; });
+    const delayed = new Promise(resolve => { release = resolve; });
+    const entries = [];
+    const ctx = fixture(t, index => index === 0 ? broker() : (entered(), delayed), {
+      recordDiagnostic: async (_stateDir, action, _model, result) => {
+        entries.push(structuredClone({ action, result }));
+      },
+    });
+    const external = new AbortController();
+    const waiting = await ctx.runtime.start(baseInput({ plugin_tools: [plugin] }));
+    const running = ctx.runtime.resume({ task_id: waiting.task_id,
+      results: [{ request_id: waiting.requests[0].request_id, result: 'continue' }] },
+    { signal: external.signal });
+    await begun;
+    if (cancellation === 'abort') external.abort();
+    else await ctx.runtime.dispose();
+    assert.equal(ctx.calls[1].signal.aborted, true);
+    assert.equal(entries.filter(entry => entry.action === 'agent_task').length, 0,
+      'an in-flight task must remain cancelling until the request settles');
+    release(completion('Late answer.'));
+    const cancelled = await running;
+    assert.equal(cancelled.state, 'cancelled');
+    const tasks = entries.filter(entry => entry.action === 'agent_task');
+    assert.equal(tasks.length, 1);
+    assert.equal(tasks[0].result.state, 'cancelled');
+    assert.equal(tasks[0].result.ok, false);
+    assert.equal(tasks[0].result.elapsed_ms, cancelled.elapsed_ms);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    if (cancellation === 'abort') {
+      assert.equal((await ctx.runtime.status({ task_id: cancelled.task_id })).elapsed_ms, cancelled.elapsed_ms);
+      await ctx.runtime.cancel({ task_id: cancelled.task_id });
+    }
+    await ctx.runtime.dispose();
+    assert.equal(entries.filter(entry => entry.action === 'agent_task').length, 1);
+    assert.equal(ctx.calls.length, 2);
+  });
+}
+
+test('overlapping terminal status, cancel and dispose share one task diagnostic and frozen elapsed time', async t => {
+  let entered;
+  let release;
+  const logging = new Promise(resolve => { entered = resolve; });
+  const held = new Promise(resolve => { release = resolve; });
+  const entries = [];
+  const ctx = fixture(t, [broker(), completion()], {
+    recordDiagnostic: async (_stateDir, action, _model, result) => {
+      entries.push(structuredClone({ action, result }));
+      if (action === 'agent_task') { entered(); await held; }
+    },
+  });
+  const waiting = await ctx.runtime.start(baseInput({ plugin_tools: [plugin] }));
+  const running = ctx.runtime.resume({ task_id: waiting.task_id,
+    results: [{ request_id: waiting.requests[0].request_id, result: 'continue' }] });
+  await logging;
+  const status = ctx.runtime.status({ task_id: waiting.task_id });
+  const cancel = ctx.runtime.cancel({ task_id: waiting.task_id });
+  const dispose = ctx.runtime.dispose();
+  await new Promise(resolve => setTimeout(resolve, 15));
+  release();
+  const [completed, observed, cancelled] = await Promise.all([running, status, cancel, dispose]);
+  isComplete(completed);
+  assert.equal(observed.state, 'completed');
+  assert.equal(cancelled.state, 'completed');
+  assert.equal(observed.elapsed_ms, completed.elapsed_ms);
+  assert.equal(cancelled.elapsed_ms, completed.elapsed_ms);
+  const tasks = entries.filter(entry => entry.action === 'agent_task');
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].result.elapsed_ms, completed.elapsed_ms);
+  assert.equal(ctx.calls.length, 2);
+});
+
+test('disposal during expired-task logging prevents a concurrent start from reaching credentials or HTTP', async t => {
+  let entered;
+  let release;
+  const logging = new Promise(resolve => { entered = resolve; });
+  const held = new Promise(resolve => { release = resolve; });
+  const entries = [];
+  const ctx = fixture(t, index => index === 0 ? broker() : completion(), {
+    recordDiagnostic: async (_stateDir, action, _model, result) => {
+      entries.push(structuredClone({ action, result }));
+      if (action === 'agent_task') { entered(); await held; }
+    },
+  });
+  const waiting = await ctx.runtime.start(baseInput({ plugin_tools: [plugin], total_timeout_ms: 100 }));
+  assert.equal(waiting.state, 'waiting_for_tools');
+  await new Promise(resolve => setTimeout(resolve, 130));
+  const starting = ctx.runtime.start(baseInput());
+  await logging;
+  const disposing = ctx.runtime.dispose();
+  release();
+  await assert.rejects(starting, error => error.code === 'runtime_disposed');
+  await disposing;
+  assert.equal(ctx.counters.configuration, 1);
+  assert.equal(ctx.counters.credential, 1);
+  assert.equal(ctx.calls.length, 1);
+  assert.equal(entries.filter(entry => entry.action === 'agent_task').length, 1);
 });
 
 test('running tasks reject simultaneous continuations without another provider request', async t => {
@@ -476,7 +706,7 @@ for (const [label, code, network, transportCode] of [
     assert.equal(status.http_attempts, network.attempts);
     assert.equal(failed.steps, 1);
     assert.equal(ctx.calls.length, 1, 'runtime diagnostics must not replay a failed provider step');
-    assert.equal(entries.length, 1);
+    assert.equal(entries.length, 2);
     assert.equal(entries[0].stateDir, ctx.stateDir);
     assert.equal(entries[0].action, 'agent_step');
     assert.equal(entries[0].model, 'flash');
@@ -484,6 +714,12 @@ for (const [label, code, network, transportCode] of [
     assert.equal(entries[0].result.attempts, network.attempts);
     assert.equal(entries[0].result.request_id, undefined);
     assert.match(entries[0].result.request_id_hash, /^sha256:[0-9a-f]{16}$/);
+    assert.equal(entries[1].action, 'agent_task');
+    assert.equal(entries[1].result.state, 'failed');
+    assert.equal(entries[1].result.error_code, code);
+    assert.equal(entries[1].result.http_attempts, network.attempts);
+    assert.match(entries[1].result.task_id_hash, /^sha256:[0-9a-f]{16}$/);
+    assert.ok(!JSON.stringify(entries[1]).includes(failed.task_id));
     assert.doesNotMatch(JSON.stringify([failed, status, entries]),
       /SYNTHETIC-PRIVATE-DIAGNOSTIC-TASK|SYNTHETIC-RAW-REQUEST-ID|SYNTHETIC-RAW-DIAGNOSTIC-DETAIL|SYNTHETIC-UNSAFE-TRANSPORT-CODE|sk-SYNTHETIC-AGENT/);
   });
@@ -509,9 +745,42 @@ test('a successful broker step is logged once without implying task completion',
     results: [{ request_id: waiting.requests[0].request_id, result: 'synthetic' }] }));
   assert.equal(ready.http_attempts, 2);
   assert.equal(ctx.calls.length, 2);
-  assert.equal(entries.length, 2, 'only provider steps produce diagnostic entries');
-  assert.ok(entries.every(entry => entry.action === 'agent_step' && entry.result.ok === true));
+  assert.equal(entries.length, 3, 'provider steps and the terminal task have separate diagnostic entries');
+  assert.equal(entries.filter(entry => entry.action === 'agent_step' && entry.result.ok === true).length, 2);
+  assert.equal(entries[2].action, 'agent_task');
+  assert.equal(entries[2].result.state, 'completed');
+  assert.equal(entries[2].result.ok, true);
 });
+
+for (const [label, finish, completionTokens, reasoningTokens, expected] of [
+  ['valid', 'stop', 4096, 3584, { finish_reason: 'stop', completion_tokens: 4096, reasoning_tokens: 3584 }],
+  ['untrusted strings', 'SYNTHETIC-PRIVATE-FINISH', 'SYNTHETIC-PRIVATE-COUNT', 'SYNTHETIC-PRIVATE-REASONING',
+    { finish_reason: null, completion_tokens: null, reasoning_tokens: null }],
+  ['invalid integers', 'length', -1, Infinity,
+    { finish_reason: 'length', completion_tokens: null, reasoning_tokens: null }],
+  ['fractional and unsafe integers', 'max_output_tokens', 1.5, Number.MAX_SAFE_INTEGER + 1,
+    { finish_reason: 'max_output_tokens', completion_tokens: null, reasoning_tokens: null }],
+]) {
+  test(`step diagnostics expose only whitelisted output metadata: ${label}`, async t => {
+    const response = completion();
+    response.data.choices[0].finish_reason = finish;
+    response.data.usage = { completion_tokens: completionTokens,
+      completion_tokens_details: { reasoning_tokens: reasoningTokens, reasoning: unsafeReasoning },
+      prompt: 'SYNTHETIC-PRIVATE-USAGE-PROMPT', authorization: syntheticCredential };
+    const entries = [];
+    const ctx = fixture(t, [response], {
+      recordDiagnostic: async (_stateDir, action, _model, result) => {
+        entries.push(structuredClone({ action, result }));
+      },
+    });
+    await ctx.runtime.start(baseInput());
+    const step = entries.find(entry => entry.action === 'agent_step').result;
+    assert.deepEqual({ finish_reason: step.finish_reason,
+      completion_tokens: step.completion_tokens, reasoning_tokens: step.reasoning_tokens }, expected);
+    assert.doesNotMatch(JSON.stringify(entries), /SYNTHETIC-PRIVATE-|SYNTHETIC-HIDDEN-REASONING|sk-SYNTHETIC-AGENT/);
+    assert.equal(ctx.calls.length, 1);
+  });
+}
 
 test('injected requests default to no diagnostic filesystem writes', async t => {
   const ctx = fixture(t, index => {
@@ -541,7 +810,7 @@ test('production diagnostics preserve agent hashes and hash raw hash-shaped requ
   const diagnosticPath = join(ctx.stateDir, 'diagnostics.jsonl');
   const readEntries = () => readFileSync(diagnosticPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   const agentEntries = readEntries();
-  assert.equal(agentEntries.length, 1);
+  assert.equal(agentEntries.length, 2);
   assert.equal(agentEntries[0].request_id, expectedHash);
   assert.equal(agentEntries[0].attempt_history[0].request_id, expectedHash);
   // The CLI still passes a raw ID. A hash-shaped value must not bypass hashing,
@@ -551,9 +820,9 @@ test('production diagnostics preserve agent hashes and hash raw hash-shaped requ
       ...item, request_id_hash: rawRequestId,
     })) });
   const entries = readEntries();
-  assert.equal(entries.length, 2);
-  assert.equal(entries[1].request_id, expectedHash);
-  assert.equal(entries[1].attempt_history[0].request_id, expectedHash);
+  assert.equal(entries.length, 3);
+  assert.equal(entries[2].request_id, expectedHash);
+  assert.equal(entries[2].attempt_history[0].request_id, expectedHash);
   assert.ok(!readFileSync(diagnosticPath, 'utf8').includes(rawRequestId));
 });
 
@@ -571,7 +840,7 @@ for (const outcome of ['success', 'failure']) {
     else assert.equal(isFailed(result).error_code, 'request_failed');
     assert.equal(result.http_attempts, 1);
     assert.equal(ctx.calls.length, 1, 'logging failure must not cause a provider replay');
-    assert.equal(diagnosticCalls, 1);
+    assert.equal(diagnosticCalls, 2);
   });
 }
 

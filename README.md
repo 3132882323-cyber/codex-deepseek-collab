@@ -1,6 +1,6 @@
 # Codex × DeepSeek Collaboration
 
-让 Codex GPT 与 DeepSeek Flash/Pro 分工完成同一项任务。DeepSeek 作为 MCP 智能体交付代码、文档或整理后的资料；Codex 承担另一部分工作，统筹工具操作、插件调用与最终验收。目标是双方各承担约一半的实际工作量。
+让 Codex GPT 与 DeepSeek Flash 分工完成同一项任务。DeepSeek 作为 MCP 智能体交付代码、文档或整理后的资料；Codex 承担另一部分工作，统筹工具操作、插件调用与最终验收。目标是双方各承担约一半的实际工作量。
 
 支持并行任务、Flash 图片输入和 max 思考。DeepSeek 可通过 Codex 使用当前已授权的插件。仓库提供可安装的 skill、MCP 服务、API 客户端、配置示例和离线测试，方便自行部署与扩展。这是社区项目，与 OpenAI、DeepSeek 无隶属关系。
 
@@ -18,7 +18,7 @@
 
 本功能提供 DeepSeek 工具调用 runtime，并通过 Codex 本地 stdio MCP 接口暴露 `deepseek_agent_start/continue/status/cancel` 四个工具。它把可拆分的实质工作交给 Flash/Pro，GPT 主控负责真实插件调用、授权判断与最终验收。任务文件只复制调用者明确提交的脱敏内容到 scratch；内置文件工具限于该目录，不读任意工作区/凭据，不直接跑 shell；`codex_tool` 仅限通过 parent 传入的插件名单。会话存于进程内，MCP 退出/重启后不能继续旧 task；取消不保证撤销上游费用。工具列表与参数需从实际工具目录获取，不臆造。
 
-DeepSeek 以外部 MCP 工作者运行；这不会把 DeepSeek 注册为 Codex 原生 `spawn_agent` 的模型。主控可并行启动 Flash 与 Pro，也可与自己的 GPT 子智能体一起工作。当前可调用且获授权的插件可按任务加入名单，由 Codex 实际执行并回传必要结果；不向 DeepSeek 复制插件登录凭据，也不自动授予整个插件目录的权限。
+DeepSeek 以外部 MCP 工作者运行；这不会把 DeepSeek 注册为 Codex 原生 `spawn_agent` 的模型。主控可并行启动独立 Flash 任务，也可与自己的 GPT 子智能体一起工作。默认示例只配置 Flash；代码保留可选 Pro 路由，只有使用者明确启用且本机配置后才可调用，失败不会切换模型。当前可调用且获授权的插件可按任务加入名单，由 Codex 实际执行并回传必要结果；不向 DeepSeek 复制插件登录凭据，也不自动授予整个插件目录的权限。
 
 安装模板：
 
@@ -28,7 +28,7 @@ codex mcp add deepseek-agents -- node "<absolute-skill-directory>/scripts/deepse
 
 MCP `tool_timeout_sec` 需覆盖任务上限：默认任务预算 360 秒时可配置为 420；增加任务预算时也要相应增加 MCP 超时。已打开的旧聊天未必热加载；连接或重启 MCP 后需确认 4 个工具出现。MCP server 不自行获取额外登录授权，直接网络仅有所配 DeepSeek API。项目不是基于 Harness SDK；此版本复用已有可靠 transport 为插件中转实现轻量 runtime，Harness 为可选完整 runtime 参考。
 
-[agent-jobs.json](examples/agent-jobs.json) 提供 Flash 清洗与 Pro 证据整理的合成任务参数。让 Codex 读取其中各项 `arguments`，分别交给 `deepseek_agent_start`；它们可独立启动，返回的任务 ID 和工具请求须分别处理。参数是使用示例，不是执行记录。
+[agent-jobs.json](examples/agent-jobs.json) 提供 Flash 清洗与证据整理的合成任务参数。让 Codex 读取其中各项 `arguments`，分别交给 `deepseek_agent_start`；它们可独立启动，返回的任务 ID 和工具请求须分别处理。参数是使用示例，不是执行记录。
 
 可按模型路由配置上下文、输出上限、视觉能力和默认思考强度。`default_reasoning_effort: "max"` 启用最高档；每次默认输出预算仍为 4096 tokens，长输出须明确提高。`images` 接收主控提供的图片 data URL，Flash 与 Pro 分别核对能力，不能因图片或失败自动换模型。旧配置沿用原有预算与关闭思考的默认行为。字段、图片协议及本地字节预算见[模型能力配置](docs/capabilities.md)。
 
@@ -52,7 +52,7 @@ npm test
 在仓库根目录运行：
 
 ```powershell
-pwsh -NoProfile -File skills/deepseek-collaboration/scripts/configure-windows.ps1 -BaseUrl https://api.deepseek.com -Model deepseek-flash -ProModel deepseek-v4-pro
+pwsh -NoProfile -File skills/deepseek-collaboration/scripts/configure-windows.ps1 -BaseUrl https://api.deepseek.com -Model deepseek-flash
 ```
 
 密钥通过隐藏输入读取，以当前 Windows 用户的 DPAPI 加密保存，不放入命令行、示例文件或 Git。配置默认位于 `~/.codex/deepseek-collaboration`；设置了 `CODEX_HOME` 时位于其下。现有连接或凭据默认不覆盖，明确需要替换时使用 `-Force`。DPAPI 文件不能当作跨用户或跨设备的可移植凭据。
@@ -62,7 +62,7 @@ pwsh -NoProfile -File skills/deepseek-collaboration/scripts/configure-windows.ps
 先只生成连接配置，再通过你使用的秘密管理工具给运行客户端的进程注入 `DEEPSEEK_API_KEY`：
 
 ```bash
-node skills/deepseek-collaboration/scripts/configure.mjs --base-url https://api.deepseek.com --model deepseek-flash --pro-model deepseek-v4-pro --credential-source env
+node skills/deepseek-collaboration/scripts/configure.mjs --base-url https://api.deepseek.com --model deepseek-flash --credential-source env
 ```
 
 配置脚本不读取或保存环境变量中的密钥。环境变量方式是显式选择；DPAPI 解密失败不会回退到环境变量。不要把密钥写入项目文件或带进 shell 历史。Codex 桌面进程与终端可能拥有不同环境，需在实际执行客户端的环境中提供变量。
@@ -96,13 +96,17 @@ node skills/deepseek-collaboration/scripts/deepseek-client.mjs ask --prompt-file
 
 ## 调用可靠性
 
-默认非流式、每次输出预算 4096 tokens、每次请求 180 秒、请求操作总预算 360 秒；thinking 从本地默认配置或显式任务参数读取，旧配置默认关闭。最多尝试 3 次（含首次），只重试明确收到的 HTTP `429/500/502/503/504`，采用有限指数退避和 jitter，并遵守 `Retry-After`；要求的等待超过上限或剩余预算时停止。
+默认 JSON 非流式；确认服务商支持后，可在 `connection.json` 设置 `"transport_mode": "sse"`，通过 SSE 接收并校验完整响应。CLI 与 MCP 仍在完整结束后返回结果。流式方式可能避免长期没有响应内容的等待，但不保证连接稳定，也不自动降级或重发。每次输出预算默认 4096 tokens、每次请求 180 秒、请求操作总预算 360 秒；thinking 从本地默认配置或显式任务参数读取，旧配置默认关闭。最多尝试 3 次（含首次），只重试明确收到的 HTTP `429/500/502/503/504`，采用有限指数退避和 jitter，并遵守 `Retry-After`；要求的等待超过上限或剩余预算时停止。
 
 超时、传输中断、HTTP 200 的损坏响应、空答案、输出截断均不自动重放；认证、参数、模型错误也停止。不叠加业务重试循环。中转错误可能发生在上游已经处理之后，HTTP 重试也可能额外计费；只允许一次提交时使用 `--max-attempts 1`。
 
 客户端拒绝重定向，只向本地明确配置的 HTTPS origin 发送凭据。诊断文件设计为仅记录操作元数据，日志中的请求 ID 使用哈希；不记录提示词、答案、密钥或原始错误响应。诊断轮转为 best-effort，并发时可能丢失旧记录，不作为账单或完整审计记录。详见 [参数、错误与限制](docs/reliability.md)，完整参数可运行 `--help`。
 
+智能体记录独立的 `agent_task` 终态，避免把某轮 HTTP 200 当作整任务完成。取消会阻止后续重试和工具操作，但不能撤销在途上游费用。失败时返回此前已成功写入且仍通过哈希核对的产物，主控可检查部分进度；这不代表任务成功，也不能跨 MCP 重启续接。
+
 ## 开发与验证
+
+版本变化见 [更新记录](CHANGELOG.md)。
 
 ```bash
 npm run check
@@ -117,7 +121,7 @@ npm test
 
 本项目代码与文档采用 [MIT](LICENSE)。协作规范和客户端由实际使用方案整理，未复制以下项目的实现，也不引入其运行时依赖：
 
-- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（MIT）：参考其[有限重试策略](https://github.com/deepseek-ai/deepseek-harness/blob/ce7073d51254c26cd63b22a60835b8f948deb447/packages/llm/llm/src/retry-policy.ts)及超时行为；本客户端采用自己的非流式协议和边界。
+- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（MIT）：参考其[有限重试策略](https://github.com/deepseek-ai/deepseek-harness/blob/ce7073d51254c26cd63b22a60835b8f948deb447/packages/llm/llm/src/retry-policy.ts)及超时行为；本客户端使用独立实现的 JSON/SSE 传输和边界。
 - [Undici RetryHandler](https://github.com/nodejs/undici/blob/main/docs/docs/api/RetryHandler.md)（MIT）：重试与 `Retry-After` 的行为参考。
 - [DeepSeek 官方集成目录](https://github.com/deepseek-ai/awesome-deepseek-integration)（CC0-1.0）及 [Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/)：协议与兼容性参考。
 - [DSH Codex Collab](https://github.com/zfu691531-hash/dsh-codex-collab)（MIT）：相关的双向 Harness / Codex 桥接项目，供需要双方会话互相调用的场景参考。本仓库由主控调用独立 MCP 工作者或文本 API。

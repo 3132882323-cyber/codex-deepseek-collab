@@ -7,6 +7,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
+import { readChatCompletionStream, StreamResponseError, safeStreamResponseReason } from './deepseek-stream.mjs';
 
 const MAX_PROMPT_BYTES = 128 * 1024;
 const EXTENDED_MAX_PROMPT_BYTES = 2 * 1024 * 1024;
@@ -27,11 +28,32 @@ const ABSOLUTE_MAX_OUTPUT_TOKENS = 393216;
 const MAX_CONTEXT_TOKENS = 1048576;
 const REASONING_EFFORTS = new Set(['none', 'low', 'high', 'max']);
 const MODEL_ALIASES = ['flash', 'pro'];
+const TRANSPORT_MODES = new Set(['json', 'sse']);
 const TRUNCATED_REASONS = new Set(['length', 'max_tokens', 'max_output_tokens']);
+const DIAGNOSTIC_FINISH_REASONS = new Set(['stop', 'tool_calls', 'length', 'max_tokens',
+  'max_output_tokens', 'content_filter', 'function_call', 'insufficient_system_resource', 'aborted']);
+const DIAGNOSTIC_ACTIONS = new Set(['ask', 'models', 'agent_step', 'agent_task']);
+const DIAGNOSTIC_TASK_STATES = new Set(['completed', 'failed', 'cancelled']);
+const DIAGNOSTIC_CATEGORIES = new Set(['timeout', 'cooldown', 'http_status', 'response',
+  'body', 'transport', 'cancelled', 'ok', 'answer', 'answer_truncated']);
+const DIAGNOSTIC_ERROR_CODES = new Set([
+  'invalid_argument', 'invalid_state', 'task_not_found', 'runtime_disposed',
+  'task_limit', 'deadline_exceeded', 'step_limit', 'tool_limit', 'http_attempt_limit',
+  'context_too_large', 'model_unavailable', 'model_capability_unavailable',
+  'model_response_invalid', 'answer_incomplete', 'answer_truncated', 'empty_answer',
+  'tool_call_invalid', 'tool_result_invalid', 'path_refused', 'file_unavailable',
+  'file_too_large', 'file_limit', 'scratch_unavailable', 'runtime_failed',
+  'configuration_invalid', 'configuration_unavailable', 'configuration_too_large',
+  'credential_unavailable', 'credential_invalid', 'credential_too_large', 'credential_decryption_failed',
+  'destination_refused', 'platform_unsupported', 'api_http_error', 'retry_cooldown',
+  'retry_budget_exhausted', 'request_timeout', 'request_failed', 'request_cancelled',
+  'response_too_large', 'response_invalid', 'unexpected_failure', 'output_refused',
+  'output_unavailable', 'prompt_empty', 'prompt_invalid', 'prompt_unavailable', 'prompt_too_large',
+]);
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const TRANSPORT_CODES = new Set([
-  'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT',
-  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
   'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'DEPTH_ZERO_SELF_SIGNED_CERT',
   'SELF_SIGNED_CERT_IN_CHAIN', 'ERR_TLS_CERT_ALTNAME_INVALID',
 ]);
@@ -298,6 +320,10 @@ async function loadConfig(stateDir, optional = false) {
   if (!['dpapi', 'env'].includes(credentialSource)) {
     fail('configuration_invalid', 'The credential source must be dpapi or env.');
   }
+  const transportMode = raw.transport_mode ?? 'json';
+  if (!TRANSPORT_MODES.has(transportMode)) {
+    fail('configuration_invalid', 'The transport mode must be json or sse.');
+  }
   if (!validateModel(raw.model) || !raw.models || typeof raw.models !== 'object' || Array.isArray(raw.models)
       || !validateModel(raw.models.flash)
       || (Object.hasOwn(raw.models, 'pro') && !validateModel(raw.models.pro))
@@ -314,6 +340,7 @@ async function loadConfig(stateDir, optional = false) {
     base_url: base.href.replace(/\/$/, ''),
     allowed_origin: allowedOrigin.origin,
     protocol: 'openai',
+    transport_mode: transportMode,
     model: raw.model,
     models: { flash: raw.models.flash, ...(raw.models.pro ? { pro: raw.models.pro } : {}) },
     credential_source: credentialSource,
@@ -446,16 +473,43 @@ function safeRequestId(headers, credential, prompt) {
 }
 
 function safeTransportCode(error) {
-  let current = error;
-  for (let depth = 0; current && depth < 5; depth += 1) {
+  const pending = [{ value: error, depth: 0 }];
+  const seen = new Set();
+  for (let index = 0; index < pending.length && index < 16; index += 1) {
+    const { value, depth } = pending[index];
+    if (!value || typeof value !== 'object' || seen.has(value)) continue;
+    seen.add(value);
     try {
-      if (typeof current.code === 'string' && TRANSPORT_CODES.has(current.code)) return current.code;
-      current = current.cause;
-    } catch {
-      break;
-    }
+      const code = ownDataValue(value, 'code');
+      if (typeof code === 'string' && TRANSPORT_CODES.has(code)) return code;
+      if (depth >= 4) continue;
+      const append = child => {
+        if (pending.length < 16 && child && typeof child === 'object') pending.push({ value: child, depth: depth + 1 });
+      };
+      append(ownDataValue(value, 'cause'));
+      const errors = ownDataValue(value, 'errors');
+      if (Array.isArray(errors)) {
+        for (let item = 0; item < Math.min(errors.length, 4); item += 1) append(ownDataValue(errors, String(item)));
+      }
+    } catch { /* Untrusted or cyclic error trees yield only fixed known codes. */ }
   }
   return null;
+}
+
+function requestCancelled() {
+  return new SafeError('request_cancelled', 'The API request was cancelled; an in-flight request may still have run.');
+}
+
+async function waitForRetry(delayMs, signal) {
+  if (!signal) return await new Promise(resolve => setTimeout(resolve, delayMs));
+  await new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); };
+    const abort = () => { cleanup(); reject(requestCancelled()); };
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) { abort(); return; }
+    timer = setTimeout(() => { cleanup(); resolve(); }, delayMs);
+  });
 }
 
 function parseRetryAfter(value) {
@@ -505,7 +559,7 @@ async function withHardTimeout(work, timeoutMs, onTimeout) {
   }
 }
 
-function networkMetadata(startedAt, attempts, status, requestId, history, category, transportCode = null) {
+function networkMetadata(startedAt, attempts, status, requestId, history, category, transportCode = null, transportMode = 'json') {
   return {
     attempts,
     elapsed_ms: elapsedMs(startedAt),
@@ -513,30 +567,47 @@ function networkMetadata(startedAt, attempts, status, requestId, history, catego
     error_category: category,
     request_id: requestId,
     attempt_history: history,
+    transport_mode: transportMode,
     ...(transportCode ? { transport_code: transportCode } : {}),
   };
 }
 
-async function request(config, path, credential, body, policy) {
+async function request(config, path, credential, body, policy, control = {}) {
   const startedAt = performance.now();
+  if (!plainObject(control) || control.signal !== undefined
+      && (typeof control.signal?.aborted !== 'boolean'
+        || typeof control.signal.addEventListener !== 'function'
+        || typeof control.signal.removeEventListener !== 'function')) {
+    fail('invalid_argument', 'Invalid request cancellation control.');
+  }
+  const cancellationSignal = control.signal;
+  const transportMode = body?.stream === true ? 'sse' : 'json';
   const target = endpoint(config, path);
   const maximumResponseBytes = policy.maxResponseBytes ?? MAX_RESPONSE_BYTES;
   if (![MAX_RESPONSE_BYTES, EXTENDED_MAX_RESPONSE_BYTES].includes(maximumResponseBytes)) {
     fail('invalid_argument', 'Invalid response byte limit.');
   }
-  const headers = { Accept: 'application/json', Authorization: `Bearer ${credential}` };
+  const headers = { Accept: transportMode === 'sse' ? 'text/event-stream' : 'application/json',
+    Authorization: `Bearer ${credential}` };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const payload = body === undefined ? undefined : JSON.stringify(body);
   const prompt = typeof body?.messages?.[0]?.content === 'string' ? body.messages[0].content : null;
   const history = [];
   let lastStatus = null;
   let lastRequestId = null;
+  const checkCancelled = attempts => {
+    if (!cancellationSignal?.aborted) return;
+    const error = requestCancelled();
+    error.metadata = networkMetadata(startedAt, attempts, lastStatus, lastRequestId, history, 'cancelled', null, transportMode);
+    throw error;
+  };
 
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
+    checkCancelled(attempt - 1);
     const remaining = policy.totalTimeoutMs - elapsedExactMs(startedAt);
     if (remaining <= 0) {
       throw new SafeError('retry_budget_exhausted', 'The total request time limit was reached.', undefined,
-        networkMetadata(startedAt, attempt - 1, lastStatus, lastRequestId, history, 'timeout'));
+        networkMetadata(startedAt, attempt - 1, lastStatus, lastRequestId, history, 'timeout', null, transportMode));
     }
     lastStatus = null;
     lastRequestId = null;
@@ -558,9 +629,26 @@ async function request(config, path, credential, body, policy) {
         }
         lastStatus = response.status;
         lastRequestId = safeRequestId(response.headers, credential, prompt);
+        if (cancellationSignal?.aborted) {
+          cancelResponseBody(response);
+          checkCancelled(attempt);
+        }
         if (!response.ok) return null;
-        return await readResponseJson(response, maximumResponseBytes);
+        if (transportMode === 'json') return await readResponseJson(response, maximumResponseBytes);
+        try { return await readChatCompletionStream(response, maximumResponseBytes); }
+        catch (error) {
+          if (error instanceof StreamResponseError) {
+            const code = ownDataValue(error, 'code') === 'response_too_large' ? 'response_too_large' : 'response_invalid';
+            const failure = new SafeError(code, code === 'response_too_large'
+              ? 'The API response exceeded its byte limit.' : 'The API returned invalid or incomplete SSE data.');
+            const reason = safeStreamResponseReason(ownDataValue(error, 'reason'));
+            if (reason) failure.response_reason = reason;
+            throw failure;
+          }
+          throw error;
+        }
       }, attemptTimeout, () => cancelResponseBody(response));
+      checkCancelled(attempt);
 
       if (!response.ok) {
         // Error bodies may echo private inputs. Cancel without reading or awaiting a stuck cancel.
@@ -573,7 +661,9 @@ async function request(config, path, credential, body, policy) {
           delay_ms: decision.retry ? decision.delayMs : 0, elapsed_ms: elapsedMs(startedAt),
           request_id: lastRequestId });
         if (decision.retry) {
-          await new Promise(resolve => setTimeout(resolve, decision.delayMs));
+          checkCancelled(attempt);
+          await waitForRetry(decision.delayMs, cancellationSignal);
+          checkCancelled(attempt);
           continue;
         }
         const code = decision.reason === 'cooldown' ? 'retry_cooldown'
@@ -587,11 +677,13 @@ async function request(config, path, credential, body, policy) {
       }
       history.push({ attempt, status: response.status, category: 'ok', delay_ms: 0,
         elapsed_ms: elapsedMs(startedAt), request_id: lastRequestId });
-      return { data, metadata: networkMetadata(startedAt, attempt, response.status, lastRequestId, history, null) };
+      return { data, metadata: networkMetadata(startedAt, attempt, response.status, lastRequestId, history, null, null, transportMode) };
     } catch (error) {
+      const cancelled = cancellationSignal?.aborted || error instanceof SafeError && error.code === 'request_cancelled';
       const isTimeout = error instanceof SafeError && error.code === 'request_timeout'
         || error?.name === 'AbortError' || error?.name === 'TimeoutError';
-      const category = error instanceof SafeError && error.code === 'retry_cooldown' ? 'cooldown'
+      const category = cancelled ? 'cancelled'
+        : error instanceof SafeError && error.code === 'retry_cooldown' ? 'cooldown'
         : error instanceof SafeError && error.code === 'retry_budget_exhausted' || isTimeout ? 'timeout'
           : error instanceof SafeError && error.code === 'api_http_error' ? 'http_status'
             : error instanceof SafeError ? 'response' : response?.ok ? 'body' : 'transport';
@@ -599,9 +691,17 @@ async function request(config, path, credential, body, policy) {
         history.push({ attempt, status: lastStatus, category, delay_ms: 0,
           elapsed_ms: elapsedMs(startedAt), request_id: lastRequestId });
       }
-      const transportCode = safeTransportCode(error);
+      const transportCode = cancelled ? null : safeTransportCode(error);
       const metadata = networkMetadata(startedAt, attempt, lastStatus, lastRequestId, history,
-        category, transportCode);
+        category, transportCode, transportMode);
+      const responseReason = error instanceof SafeError && ['response_invalid', 'response_too_large'].includes(ownDataValue(error, 'code'))
+        ? safeStreamResponseReason(ownDataValue(error, 'response_reason')) : null;
+      if (!cancelled && responseReason) metadata.response_reason = responseReason;
+      if (cancelled) {
+        const cancellation = requestCancelled();
+        cancellation.metadata = metadata;
+        throw cancellation;
+      }
       if (error instanceof SafeError) {
         error.metadata = metadata;
         throw error;
@@ -765,7 +865,7 @@ async function aliasesPromptFile(promptPath, targetPath) {
 }
 
 function diagnosticRequestId(value) {
-  return typeof value === 'string'
+  return typeof value === 'string' && value.length <= 96
     ? `sha256:${createHash('sha256').update(value).digest('hex').slice(0, 16)}` : null;
 }
 
@@ -776,25 +876,87 @@ function diagnosticRequestFingerprint(raw, fingerprint) {
     ? fingerprint : null;
 }
 
-async function recordDiagnostic(stateDir, action, model, result, promptPath) {
-  const entry = {
+function ownDataValue(value, key) {
+  if (value === null || typeof value !== 'object') return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+  } catch { return undefined; }
+}
+
+function diagnosticCount(value, fallback = 0, maximum = Number.MAX_SAFE_INTEGER) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= maximum ? value : fallback;
+}
+
+function diagnosticStatus(value) {
+  return Number.isSafeInteger(value) && value >= 100 && value <= 599 ? value : null;
+}
+
+function diagnosticEnum(value, allowed) { return allowed.has(value) ? value : null; }
+
+function diagnosticHistory(value) {
+  if (!Array.isArray(value)) return [];
+  const history = [];
+  for (let index = 0; index < Math.min(3, diagnosticCount(ownDataValue(value, 'length'))); index += 1) {
+    const item = ownDataValue(value, String(index));
+    const get = key => ownDataValue(item, key);
+    const attempt = diagnosticCount(get('attempt'), null, 3);
+    if (!attempt) continue;
+    history.push({ attempt, status: diagnosticStatus(get('status')),
+      category: diagnosticEnum(get('category'), DIAGNOSTIC_CATEGORIES),
+      delay_ms: diagnosticCount(get('delay_ms')), elapsed_ms: diagnosticCount(get('elapsed_ms')),
+      request_id: diagnosticRequestFingerprint(get('request_id'), get('request_id_hash')) });
+  }
+  return history;
+}
+
+function diagnosticEntry(action, model, result) {
+  if (!DIAGNOSTIC_ACTIONS.has(action)) return null;
+  const get = key => ownDataValue(result, key);
+  const common = {
     timestamp: new Date().toISOString(),
     action,
-    model,
-    ok: result.ok === true,
-    attempts: Number.isInteger(result.attempts) ? result.attempts : 0,
-    elapsed_ms: Number.isFinite(result.elapsed_ms) ? result.elapsed_ms : 0,
-    http_status: Number.isInteger(result.http_status) ? result.http_status : null,
-    error_code: result.error_code ?? null,
-    error_category: result.error_category ?? null,
-    transport_code: result.transport_code ?? null,
-    request_id: diagnosticRequestFingerprint(result.request_id, result.request_id_hash),
-    attempt_history: Array.isArray(result.attempt_history) ? result.attempt_history.map(item => ({
-      attempt: item.attempt, status: item.status, category: item.category,
-      delay_ms: item.delay_ms, elapsed_ms: item.elapsed_ms,
-      request_id: diagnosticRequestFingerprint(item.request_id, item.request_id_hash),
-    })) : [],
+    model: MODEL_ALIASES.includes(model) ? model : null,
+    ok: get('ok') === true,
+    elapsed_ms: diagnosticCount(get('elapsed_ms')),
+    error_code: diagnosticEnum(get('error_code'), DIAGNOSTIC_ERROR_CODES),
+    response_reason: safeStreamResponseReason(get('response_reason')),
   };
+  if (action === 'agent_task') return { ...common,
+    transport_mode: diagnosticEnum(get('transport_mode'), TRANSPORT_MODES),
+    state: diagnosticEnum(get('state'), DIAGNOSTIC_TASK_STATES),
+    task_id_hash: diagnosticRequestFingerprint(undefined, get('task_id_hash')),
+    reasoning_effort: diagnosticEnum(get('reasoning_effort'), REASONING_EFFORTS),
+    total_timeout_ms: diagnosticCount(get('total_timeout_ms'), null, MAX_TOTAL_TIMEOUT_MS),
+    max_output_tokens: diagnosticCount(get('max_output_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS),
+    max_steps: diagnosticCount(get('max_steps'), null, 12),
+    max_tool_calls: diagnosticCount(get('max_tool_calls'), null, 32),
+    max_http_attempts: diagnosticCount(get('max_http_attempts'), null, 18),
+    steps: diagnosticCount(get('steps'), 0, 12), tool_calls: diagnosticCount(get('tool_calls'), 0, 32),
+    http_attempts: diagnosticCount(get('http_attempts'), 0, 18),
+    artifact_count: diagnosticCount(get('artifact_count'), 0, 128),
+  };
+  const usage = get('usage');
+  return { ...common,
+    transport_mode: diagnosticEnum(get('transport_mode'), TRANSPORT_MODES),
+    attempts: diagnosticCount(get('attempts'), 0, 3),
+    http_status: diagnosticStatus(get('http_status')),
+    error_category: diagnosticEnum(get('error_category'), DIAGNOSTIC_CATEGORIES),
+    transport_code: diagnosticEnum(get('transport_code'), TRANSPORT_CODES),
+    request_id: diagnosticRequestFingerprint(get('request_id'), get('request_id_hash')),
+    attempt_history: diagnosticHistory(get('attempt_history')),
+    finish_reason: diagnosticEnum(get('finish_reason'), DIAGNOSTIC_FINISH_REASONS),
+    completion_tokens: diagnosticCount(get('completion_tokens') ?? ownDataValue(usage, 'completion_tokens'), null),
+    reasoning_tokens: diagnosticCount(get('reasoning_tokens')
+      ?? ownDataValue(ownDataValue(usage, 'completion_tokens_details'), 'reasoning_tokens'), null),
+  };
+}
+
+async function recordDiagnostic(stateDir, action, model, result, promptPath) {
+  let entry;
+  try { entry = diagnosticEntry(action, model, result); }
+  catch { return false; }
+  if (!entry) return false;
   const line = `${JSON.stringify(entry)}\n`;
   const currentPath = join(stateDir, 'diagnostics.jsonl');
   const previousPath = join(stateDir, 'diagnostics.previous.jsonl');
@@ -839,8 +1001,9 @@ async function executeNetwork(options, action, model, config, path, credential, 
       result = { ...result, ...requestMetadata, error_category: 'response' };
     }
   }
+  const modelAlias = MODEL_ALIASES.find(alias => config.models?.[alias] === model) ?? null;
   result.diagnostic_recorded = await recordDiagnostic(options.stateDir, action,
-    redact(model, credential), result, options.promptFile);
+    modelAlias, result, options.promptFile);
   if (failedByException) {
     await emitResult(result, options, process.stderr);
     return;
@@ -875,6 +1038,7 @@ async function main() {
       base_url: config?.base_url ?? null,
       allowed_origin: config?.allowed_origin ?? null,
       protocol: config?.protocol ?? null,
+      transport_mode: config?.transport_mode ?? 'json',
       model: config?.model ?? null,
       models: config?.models ?? null,
       capabilities: config?.capabilities ?? null,
@@ -917,6 +1081,7 @@ async function main() {
     await emitResult({
       ok: true,
       dry_run: true,
+      transport_mode: config.transport_mode,
       model_requested: model,
       prompt_bytes: buffer.byteLength,
       max_prompt_bytes: profile.max_prompt_bytes,
@@ -942,7 +1107,8 @@ async function main() {
     max_tokens: maxOutputTokens,
     thinking: { type: thinking },
     ...(effort === undefined ? {} : { reasoning_effort: effort }),
-    stream: false,
+    stream: config.transport_mode === 'sse',
+    ...(config.transport_mode === 'sse' ? { stream_options: { include_usage: true } } : {}),
   }, { ...options, maxResponseBytes: profile.max_response_bytes },
   data => generationResult(data, model, credential));
 }
@@ -959,4 +1125,4 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import
   });
 }
 
-export { SafeError, loadConfig, loadCredential, request, recordDiagnostic, safeTransportCode };
+export { SafeError, loadConfig, loadCredential, request, recordDiagnostic, safeTransportCode, safeStreamResponseReason };

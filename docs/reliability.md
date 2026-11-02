@@ -6,13 +6,19 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `connection.json` | 明确指定 HTTPS `base_url`、相同 origin 的 `allowed_origin`、`openai` 协议、准确模型及 `flash` / 可选 `pro` 别名、凭据来源 |
+| `connection.json` | 明确指定 HTTPS `base_url`、相同 origin 的 `allowed_origin`、`openai` 协议、准确模型及 `flash` / 可选 `pro` 别名、凭据来源和传输方式 |
 | `credential.dpapi` | 仅 Windows DPAPI 方式使用的密文，不能公开或跨设备复用 |
 | `diagnostics.jsonl` | 最多约 512 KiB 的安全操作元数据，轮转保留一份 previous 文件 |
 
 示例见 [connection.example.json](../skills/deepseek-collaboration/references/connection.example.json)。`credential_source` 为 `env` 时仅使用 `DEEPSEEK_API_KEY`；缺省或 `dpapi` 时仅使用 DPAPI，二者不相互回退。配置中不要加入明文密钥。只支持模型名以 `deepseek` 开头的提供商别名，不将此检查视为上游身份认证。
 
 `allowed_origin` 是本地配置的目标确认，不是独立信任证明。只使用你信任并授权的服务商，保护状态目录免受非授权修改。客户端不验证提供商的存储、路由或模型真实性。
+
+默认示例仅配置 Flash。停用 Pro 时移除 `models.pro` 与对应 `capabilities.pro`；缺少路由的任务在读取凭据和联网前失败，不自动恢复配置或换模型。只有使用者明确重新启用后才添加 Pro。
+
+`transport_mode` 可选 `json`（缺省）或 `sse`。先确认当前服务商支持流式协议，再明确设为 `sse`；CLI 与 MCP 的生成请求会发送 `stream: true` 和 `stream_options.include_usage: true`，模型列表 GET 仍用 JSON。SSE 在完整结束后转换为同一结果结构，不向终端逐字显示。接收评论与心跳、分段文字和工具调用，但必须同时收到合法结束原因与 `[DONE]`；断流、损坏帧、超限或缺少终止标记均失败，不使用部分答案或自动切回 JSON。单次期限覆盖整个响应，包括心跳，响应字节预算也包含 SSE 帧与推理内容。
+
+官方接口会在等待中使用非流式空行或 SSE 评论维持连接；兼容网关未必保持同样行为。SSE 可改善有中间数据时的等待，不能证明或修复所有网络与上游故障。[DeepSeek 连接说明](https://api-docs.deepseek.com/quick_start/rate_limit/)
 
 ## 命令
 
@@ -38,7 +44,7 @@ deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [options]
 | `--output` | 可选，原子写入本次结果 JSON；父目录需已存在 |
 | `--dry-run` | 仅校验，不写 output |
 
-CLI `ask` 输入为 UTF-8 文本；旧配置最大 128 KiB、响应最大 4 MiB；配置有效上下文窗口后分别为 2 MiB 和 16 MiB。这些是本地字节限制。此命令只发单条 user 消息，固定 `stream: false`，不提供工具执行器、持久会话、图像输入或流式输出。thinking 开启时，推理和最终内容共享生成限制；只有最终 `message.content` 作为答案。MCP 智能体的图片、工具循环与文件限制另见[能力配置](capabilities.md)和[智能体接口](../skills/deepseek-collaboration/references/agents.md)。
+CLI `ask` 输入为 UTF-8 文本；旧配置最大 128 KiB、响应最大 4 MiB；配置有效上下文窗口后分别为 2 MiB 和 16 MiB。这些是本地字节限制。此命令只发单条 user 消息，不提供工具执行器、持久会话或图像输入；传输方式读取本地配置。thinking 开启时，推理和最终内容共享生成限制；只有最终 `message.content` 作为答案。MCP 智能体的图片、工具循环与文件限制另见[能力配置](capabilities.md)和[智能体接口](../skills/deepseek-collaboration/references/agents.md)。
 
 ## 完整性与失败
 
@@ -49,6 +55,12 @@ CLI `ask` 输入为 UTF-8 文本；旧配置最大 128 KiB、响应最大 4 MiB�
 结果包含 attempts、elapsed_ms、http_status、error_category、过滤后的 request_id 和 attempt_history；传输错误仅返回允许的短代码。诊断日志保存相同类别的元数据，请求 ID 在写日志前转为哈希。不保存原始错误消息、响应头、错误正文、提示词或答案。远端返回的模型、用量和请求标识仍属不可信数据。
 
 MCP 智能体的每轮 HTTP 操作以 `action: "agent_step"` 写入同一安全日志。这里的 `ok: true` 仅表示该轮请求返回，后续仍可能等待插件、被取消或因输出不完整而失败；整任务完成须检查 `state: "completed"` 并独立验收。HTTP 请求失败时，工具结果中的 `network` 仅返回 attempts、elapsed_ms、http_status、error_category 和允许的 transport_code，不回传原始请求标识或错误正文。缺少旧日志时不能事后推断某次失败的具体根因。
+
+每个任务还以 `action: "agent_task"` 记录一次终态：模型别名、任务 ID 哈希、state、错误短码、步骤/工具/HTTP 次数、预算、产物数量与固定终态耗时。后续 status/cancel 查询不重复写终态或延长耗时。步骤可记录受控的 finish_reason、数值型 completion/reasoning token 用量与传输方式；SSE 格式错误另有白名单 `response_reason` 短码，不回传原始帧或异常文本，不记录推理原文。日志写入失败不改变任务结果。
+
+取消后不会再发起新的 POST、进入下一次退避重试或执行新工具；已经发出的请求仍可能运行到原有期限。失败任务只返回本任务中先前成功 `write_file` 且仍符合大小、路径与 SHA-256 校验的文件。未改动的输入文件、写入未完成或已被篡改的文件不算产物；不安全 scratch 无法收集时保留原始失败并返回空产物。取消只返回状态元数据，不承诺恢复文件或跨进程恢复。
+
+最高档推理可能消耗大部分输出预算。对长任务先定义较小、可验收的文件交付与生成预算，在每批写入后检查哈希，结束答复保持简短；`length/max_tokens/max_output_tokens` 一律判为截断。不能因 HTTP 200 或已有部分文件而宣称完成，也不自动扩大预算重做任务。
 
 安全校验后的输出目标会记录当前本地失败；非法参数、不安全目标或无法写入的路径可能只能返回非零退出码与 stderr JSON。读取旧输出时尤其需要检查本次退出码。输出不能覆盖提示词、配置、凭据或诊断日志，也不能通过符号链接或硬链接绕过这些检查。
 

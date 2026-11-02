@@ -3,8 +3,9 @@
   "allowed_origin": "https://api.deepseek.com",
   "protocol": "openai",
   "model": "deepseek-flash",
-  "models": { "flash": "deepseek-flash", "pro": "deepseek-v4-pro" },
+  "models": { "flash": "deepseek-flash" },
   "credential_source": "env",
+  "transport_mode": "json",
   "default_reasoning_effort": "none",
   "capabilities": {
     "flash": {
@@ -16,11 +17,6 @@
         "max_image_bytes": 2097152,
         "max_total_image_bytes": 4194304
       }
-    },
-    "pro": {
-      "context_window_tokens": 1048576,
-      "max_output_tokens": 8192,
-      "vision": { "enabled": false }
     }
   }
 }

@@ -237,7 +237,7 @@ export function createMcpServer({runtime = createAgentRuntime(), input = process
       sendResult(id, {
         protocolVersion,
         capabilities: {tools: {}},
-        serverInfo: {name: 'codex-deepseek-collab', version: '0.3.0'},
+        serverInfo: {name: 'codex-deepseek-collab', version: '0.4.0'},
         instructions:
           'This server coordinates external Pro/Flash agents. Pending codex_tool requests are executed by the host under existing permission scopes; no credentials are transferred.',
       });
