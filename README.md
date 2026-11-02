@@ -1,8 +1,8 @@
 # Codex × DeepSeek Collaboration
 
-把可拆分的实质工作交给两个模型共同完成：Codex GPT 统筹工具操作、承担一部分产出并整合验收，DeepSeek Flash/Pro 通过外部 MCP 智能体或文本 API 承担另一部分产出。默认目标是按预计工作量约 50/50 分工。
+让 Codex GPT 与 DeepSeek Flash/Pro 分工完成同一项任务。DeepSeek 作为 MCP 智能体交付代码、文档或整理后的资料；Codex 承担另一部分工作，统筹工具操作、插件调用与最终验收。目标是双方各承担约一半的实际工作量。
 
-仓库包含可安装的 Codex skill、无第三方运行时依赖的 Node.js 客户端与 MCP server、配置脚本、协作示例和离线测试。社区项目，与 OpenAI、DeepSeek 无隶属关系。
+支持并行任务、Flash 图片输入和 max 思考。DeepSeek 可通过 Codex 使用当前已授权的插件。仓库提供可安装的 skill、MCP 服务、API 客户端、配置示例和离线测试，方便自行部署与扩展。这是社区项目，与 OpenAI、DeepSeek 无隶属关系。
 
 ## 用途与工作方式
 
