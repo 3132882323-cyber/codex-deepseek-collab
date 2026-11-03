@@ -12,6 +12,8 @@ outputs/
 /result.json
 .state/
 .codex/
+/deepseek-native/
+/deepseek-flash.config.toml
 .DS_Store
 Thumbs.db
 *.tgz

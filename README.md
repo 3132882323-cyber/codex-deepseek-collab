@@ -1,8 +1,24 @@
 # Codex × DeepSeek Collaboration
 
-让 Codex GPT 与 DeepSeek Flash 分工完成同一项任务。DeepSeek 作为 MCP 智能体交付代码、文档或整理后的资料；Codex 承担另一部分工作，统筹工具操作、插件调用与最终验收。目标是双方各承担约一半的实际工作量。
+在 Codex 自身的会话与工具执行器中使用 DeepSeek Flash，或保留 GPT 主控，通过 MCP 与 Flash 分工。原生模式使用 Responses API、本机预算守卫和可恢复的配置切换；协作模式以双方各承担约一半实际工作量为目标。
 
-支持并行任务、Flash 图片输入和 max 思考。DeepSeek 可通过 Codex 使用当前已授权的插件。仓库提供可安装的 skill、MCP 服务、API 客户端、配置示例和离线测试，方便自行部署与扩展。这是社区项目，与 OpenAI、DeepSeek 无隶属关系。
+仓库提供可安装的 skill、MCP 服务、原生模型接入脚本、API 客户端和离线测试。工具权限仍由 Codex 决定；账号插件、图片和服务商能力须分别核验。这是社区项目，与 OpenAI、DeepSeek 无隶属关系。
+
+## 原生 Flash 模式
+
+这里的“原生”指 Codex 负责工作区、工具执行、审批、历史和上下文压缩，Flash 通过 Responses 提供模型响应。本机守卫只处理协议、预算与网络边界，不另建文件工具智能体，也不接管 Codex 的审批。
+
+Windows / PowerShell 7 用户配置好下文的 Flash 凭据后，可运行：
+
+```powershell
+node skills/deepseek-collaboration/scripts/install-native.mjs --codex-bin "C:/Tools/Codex/codex.exe" --planned-output-tokens 32768
+```
+
+安装要求 Codex 0.144 或更新版本；当前在 0.163.0-alpha.11.2 验证。所配网关必须支持 `/responses`，仅有 `/chat/completions` 不够。安装保留 GPT 全局默认，生成 `~/.codex/deepseek-flash.config.toml`；运行 `codex --profile deepseek-flash`，或使用生成的 `~/.codex/deepseek-native/Codex DeepSeek Flash.cmd`。模型 ID、上下文与能力上限从已有 Flash 配置读取，密钥继续留在原 DPAPI 文件中。
+
+桌面模式另提供 `Enable DeepSeek in Codex.cmd` 和 `Restore GPT in Codex.cmd`：使用 Codex 公共配置 API 保存并切换必要字段，恢复时检查这些字段是否又被用户修改。**桌面切换需要重启应用**，不能将 CLI profile 或模型目录解释为桌面聊天内的 provider 切换按钮。详见[原生接入、验收与限制](docs/native-codex.md)。
+
+GPT 父会话的自定义子智能体不能覆盖父 provider，所以这个模式不会把 Flash 自动加入 GPT `spawn_agent` 的跨服务商模型名单；需要 GPT 主控与 Flash 同时分工时，仍使用下面的 MCP 协作模式。
 
 ## 用途与工作方式
 
