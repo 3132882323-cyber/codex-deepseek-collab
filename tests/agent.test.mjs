@@ -19,6 +19,11 @@ const configuration = {
   base_url: 'https://api.example.test/v1', allowed_origin: 'https://api.example.test',
   protocol: 'openai', model: models.flash, models, credential_source: 'env',
 };
+function outputBudgetConfiguration(withPolicy = true) {
+  return { ...configuration, default_reasoning_effort: 'max',
+    capabilities: { flash: { max_output_tokens: 32768 } },
+    ...(withPolicy ? { output_budget_policy: { flash: { max_reasoning_min_output_tokens: 16384 } } } : {}) };
+}
 const plugin = { name: 'lookup_reference', description: 'Get a synthetic display prefix.',
   input_schema: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } };
 
@@ -118,7 +123,6 @@ test('agent completes a text task without returning credentials or hidden reason
   assert.equal(ctx.counters.credential, 1);
   assert.doesNotMatch(JSON.stringify(result), new RegExp(syntheticCredential + '|' + unsafeReasoning));
 });
-
 test('multi-step file production crosses the Codex broker and returns executable hashed artifacts', async t => {
   const source = JSON.stringify([{ id: 7, name: 'Ada' }, { id: 8, name: 'Lin' }]);
   const artifact = 'export const render = rows => rows.map(row => `Hello ${row.name} (#${row.id})`).join("\\n");\n';
@@ -385,8 +389,9 @@ for (const code of ['request_failed', 'step_limit', 'answer_truncated']) {
     assert.equal(taskEntries.length, 1);
     const task = taskEntries[0].result;
     assert.deepEqual(Object.keys(task).sort(), ['ok', 'state', 'transport_mode', 'task_id_hash', 'reasoning_effort',
-      'total_timeout_ms', 'max_output_tokens', 'max_steps', 'max_tool_calls', 'max_http_attempts',
-      'steps', 'tool_calls', 'http_attempts', 'error_code', 'artifact_count', 'elapsed_ms'].sort());
+      'total_timeout_ms', 'max_output_tokens', 'minimum_output_tokens', 'max_steps', 'max_tool_calls', 'max_http_attempts',
+      'steps', 'tool_calls', 'http_attempts', 'error_code', 'last_response', 'budget_exhaustion',
+      'artifact_count', 'elapsed_ms'].sort());
     assert.equal(task.state, 'failed');
     assert.equal(task.error_code, code);
     assert.equal(task.reasoning_effort, 'max');
@@ -965,4 +970,79 @@ test('pending tasks still obey the active task capacity without a seventeenth pr
   }
   await rejectedWithoutRequest(ctx, () => ctx.runtime.start(baseInput({ plugin_tools: [plugin] })));
   assert.equal(ctx.calls.length, 16);
+});
+
+test('configured max minimum rejects an omitted 4096 budget before credential and scratch effects', async t => {
+  const ctx = fixture(t, [], { configuration: outputBudgetConfiguration() });
+  const failed = isFailed(await ctx.runtime.start(baseInput()));
+  assert.equal(failed.error_code, 'output_budget_insufficient');
+  assert.equal(failed.output_budget.requested_output_tokens, 4096);
+  assert.equal(failed.output_budget.minimum_output_tokens, 16384);
+  assert.equal(failed.last_response, null);
+  assert.equal(failed.steps, 0);
+  assert.equal(failed.http_attempts, 0);
+  assert.equal(ctx.counters.credential, 0);
+  assert.equal(ctx.calls.length, 0);
+  assert.deepEqual(readdirSync(ctx.scratchRoot), []);
+});
+
+test('first explicit max budget and explicit none keep their requested values', async t => {
+  for (const [effort, tokens] of [['max', 16384], ['none', 4096]]) {
+    const ctx = fixture(t, [completion()], { configuration: outputBudgetConfiguration() });
+    isComplete(await ctx.runtime.start(baseInput({ reasoning_effort: effort, max_output_tokens: tokens })));
+    assert.equal(ctx.calls.length, 1);
+    assert.equal(ctx.calls[0].body.max_tokens, tokens);
+    assert.equal(ctx.calls[0].body.reasoning_effort, effort === 'none' ? undefined : effort);
+    assert.equal(ctx.calls[0].body.thinking.type, effort === 'none' ? 'disabled' : 'enabled');
+    assert.ok(ctx.calls[0].body.messages[0].content.includes(String(tokens)));
+  }
+});
+
+test('no configured policy retains max 4096 without silently increasing it', async t => {
+  const ctx = fixture(t, [completion()], { configuration: outputBudgetConfiguration(false) });
+  isComplete(await ctx.runtime.start(baseInput()));
+  assert.equal(ctx.calls[0].body.max_tokens, 4096);
+  assert.equal(ctx.calls[0].body.reasoning_effort, 'max');
+});
+
+test('truncation exposes reported exhaustion but never replays or executes an unfinished tool', async t => {
+  const cases = [
+    [4096, 4096, 'reasoning'], [4096, 1200, 'mixed'], [4000, 4000, 'unknown'],
+    [4096, 4097, 'unknown'], [4096, '4096', 'unknown'], [undefined, undefined, 'unknown'],
+  ];
+  for (const [total, reasoning, expected] of cases) {
+    const response = toolResponse(toolCall('synthetic_incomplete', 'write_file',
+      { path: 'must-not-exist.txt', content: 'not committed' }));
+    response.data.choices[0].finish_reason = 'length';
+    response.data.usage = { completion_tokens: total, completion_tokens_details: { reasoning_tokens: reasoning } };
+    const ctx = fixture(t, [response], { configuration: outputBudgetConfiguration(false) });
+    const failed = isFailed(await ctx.runtime.start(baseInput()));
+    assert.equal(failed.error_code, 'answer_truncated');
+    assert.equal(failed.max_output_tokens, 4096);
+    assert.equal(failed.last_response.step_index, 1);
+    assert.equal(failed.last_response.finish_reason, 'length');
+    assert.equal(failed.budget_exhaustion, expected);
+    assert.equal(ctx.calls.length, 1);
+    assert.equal(failed.tool_calls, 0);
+    assert.deepEqual(failed.artifacts, []);
+  }
+});
+
+test('production step and task diagnostics correlate budgets without exposing reasoning', async t => {
+  const response = completion();
+  response.data.choices[0].finish_reason = 'length';
+  response.data.usage = { completion_tokens: 4096, completion_tokens_details: { reasoning_tokens: 4096 } };
+  const ctx = fixture(t, [response], { configuration: outputBudgetConfiguration(false), recordDiagnostic });
+  const failed = isFailed(await ctx.runtime.start(baseInput()));
+  const entries = readFileSync(join(ctx.stateDir, 'diagnostics.jsonl'), 'utf8').trim().split(/\r?\n/).map(JSON.parse);
+  assert.deepEqual(entries.map(entry => entry.action), ['agent_step', 'agent_task']);
+  const taskHash = 'sha256:' + createHash('sha256').update(failed.task_id).digest('hex').slice(0, 16);
+  assert.equal(entries[0].task_id_hash, taskHash);
+  assert.equal(entries[1].task_id_hash, taskHash);
+  assert.equal(entries[0].step_index, 1);
+  assert.equal(entries[0].max_output_tokens, 4096);
+  assert.equal(entries[0].reasoning_effort, 'max');
+  assert.deepEqual(entries[1].last_response, failed.last_response);
+  assert.equal(entries[1].budget_exhaustion, 'reasoning');
+  assert.doesNotMatch(JSON.stringify(entries), new RegExp(unsafeReasoning + '|' + failed.task_id));
 });

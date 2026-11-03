@@ -28,9 +28,11 @@ codex mcp add deepseek-agents -- node "<absolute-skill-directory>/scripts/deepse
 
 MCP `tool_timeout_sec` 需覆盖任务上限：默认任务预算 360 秒时可配置为 420；增加任务预算时也要相应增加 MCP 超时。已打开的旧聊天未必热加载；连接或重启 MCP 后需确认 4 个工具出现。MCP server 不自行获取额外登录授权，直接网络仅有所配 DeepSeek API。项目不是基于 Harness SDK；此版本复用已有可靠 transport 为插件中转实现轻量 runtime，Harness 为可选完整 runtime 参考。
 
-[agent-jobs.json](examples/agent-jobs.json) 提供 Flash 清洗与证据整理的合成任务参数。让 Codex 读取其中各项 `arguments`，分别交给 `deepseek_agent_start`；它们可独立启动，返回的任务 ID 和工具请求须分别处理。参数是使用示例，不是执行记录。
+[agent-jobs.json](examples/agent-jobs.json) 提供 Flash 清洗与证据整理的合成任务参数，首次显式选择 `max` 与 16384 生成预算，需先确认所选路由输出上限至少为 16384。让 Codex 读取其中各项 `arguments`，分别交给 `deepseek_agent_start`；它们可独立启动，返回的任务 ID 和工具请求须分别处理。参数是使用示例，不是执行记录。
 
 可按模型路由配置上下文、输出上限、视觉能力和默认思考强度。`default_reasoning_effort: "max"` 启用最高档；每次默认输出预算仍为 4096 tokens，长输出须明确提高。`images` 接收主控提供的图片 data URL，Flash 与 Pro 分别核对能力，不能因图片或失败自动换模型。旧配置沿用原有预算与关闭思考的默认行为。字段、图片协议及本地字节预算见[模型能力配置](docs/capabilities.md)。
+
+思考、答案与工具参数共享每轮生成预算。容量上限不会自动成为请求预算；`max` 配 4096 可能在答案开始前耗尽。首次提交应明确规划，小型独立任务可参考 16384、代码或多文件可参考 32768，均不保证足够。可选 `output_budget_policy` 在读取凭据和 HTTP 前拒绝过小的有效 `max` 请求，不暗中提高预算；未配置时保留旧默认，实际截断后也不自动扩容重发。见[共享输出预算](docs/output-budgets.md)。
 
 参考：[Codex MCP 文档](https://learn.chatgpt.com/docs/extend/mcp) · [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 

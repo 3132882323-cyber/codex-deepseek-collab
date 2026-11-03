@@ -8,6 +8,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { readChatCompletionStream, StreamResponseError, safeStreamResponseReason } from './deepseek-stream.mjs';
+import { assessOutputBudget } from './deepseek-budget.mjs';
 
 const MAX_PROMPT_BYTES = 128 * 1024;
 const EXTENDED_MAX_PROMPT_BYTES = 2 * 1024 * 1024;
@@ -40,7 +41,7 @@ const DIAGNOSTIC_ERROR_CODES = new Set([
   'invalid_argument', 'invalid_state', 'task_not_found', 'runtime_disposed',
   'task_limit', 'deadline_exceeded', 'step_limit', 'tool_limit', 'http_attempt_limit',
   'context_too_large', 'model_unavailable', 'model_capability_unavailable',
-  'model_response_invalid', 'answer_incomplete', 'answer_truncated', 'empty_answer',
+  'model_response_invalid', 'answer_incomplete', 'answer_truncated', 'empty_answer', 'output_budget_insufficient',
   'tool_call_invalid', 'tool_result_invalid', 'path_refused', 'file_unavailable',
   'file_too_large', 'file_limit', 'scratch_unavailable', 'runtime_failed',
   'configuration_invalid', 'configuration_unavailable', 'configuration_too_large',
@@ -283,6 +284,31 @@ export function getModelCapabilities(config, alias) {
   };
 }
 
+function parseOutputBudgetPolicy(raw, config) {
+  if (raw === undefined) return null;
+  if (!plainObject(raw)) fail('configuration_invalid', 'The output budget policy is invalid.');
+  const policies = {};
+  for (const [alias, value] of Object.entries(raw)) {
+    if (!MODEL_ALIASES.includes(alias) || !config?.models?.[alias] || !plainObject(value)
+        || Object.keys(value).length !== 1 || !Object.hasOwn(value, 'max_reasoning_min_output_tokens')
+        || !capabilityInteger(value.max_reasoning_min_output_tokens, 32, ABSOLUTE_MAX_OUTPUT_TOKENS)) {
+      fail('configuration_invalid', 'The output budget policy is invalid.');
+    }
+    const minimum = value.max_reasoning_min_output_tokens;
+    if (minimum > getModelCapabilities(config, alias).max_output_tokens) {
+      fail('configuration_invalid', 'The minimum output budget exceeds the configured route limit.');
+    }
+    policies[alias] = { max_reasoning_min_output_tokens: minimum };
+  }
+  return policies;
+}
+
+export function getOutputBudgetPolicy(config, alias) {
+  getModelCapabilities(config, alias);
+  const policy = parseOutputBudgetPolicy(config.output_budget_policy, config);
+  return { max_reasoning_min_output_tokens: policy?.[alias]?.max_reasoning_min_output_tokens ?? null };
+}
+
 async function loadConfig(stateDir, optional = false) {
   const buffer = await readBoundedFile(join(stateDir, 'connection.json'), MAX_CONFIG_BYTES, 'configuration', optional);
   if (buffer === null) return null;
@@ -335,6 +361,8 @@ async function loadConfig(stateDir, optional = false) {
     fail('configuration_invalid', 'The default reasoning effort is invalid.');
   }
   const capabilities = parseCapabilities(raw.capabilities, raw.models);
+  const outputBudgetPolicy = parseOutputBudgetPolicy(raw.output_budget_policy,
+    { models: raw.models, ...(capabilities === null ? {} : { capabilities }) });
   base.pathname = base.pathname.replace(/\/+$/, '');
   return {
     base_url: base.href.replace(/\/$/, ''),
@@ -345,6 +373,7 @@ async function loadConfig(stateDir, optional = false) {
     models: { flash: raw.models.flash, ...(raw.models.pro ? { pro: raw.models.pro } : {}) },
     credential_source: credentialSource,
     ...(capabilities === null ? {} : { capabilities }),
+    ...(outputBudgetPolicy === null ? {} : { output_budget_policy: outputBudgetPolicy }),
     ...(raw.default_reasoning_effort === undefined ? {}
       : { default_reasoning_effort: raw.default_reasoning_effort }),
   };
@@ -910,6 +939,16 @@ function diagnosticHistory(value) {
   return history;
 }
 
+function diagnosticLastResponse(value) {
+  const get = key => ownDataValue(value, key);
+  const step = diagnosticCount(get('step_index'), null, 12);
+  if (!step) return null;
+  return { step_index: step,
+    finish_reason: diagnosticEnum(get('finish_reason'), DIAGNOSTIC_FINISH_REASONS),
+    completion_tokens: diagnosticCount(get('completion_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS),
+    reasoning_tokens: diagnosticCount(get('reasoning_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS) };
+}
+
 function diagnosticEntry(action, model, result) {
   if (!DIAGNOSTIC_ACTIONS.has(action)) return null;
   const get = key => ownDataValue(result, key);
@@ -935,9 +974,19 @@ function diagnosticEntry(action, model, result) {
     steps: diagnosticCount(get('steps'), 0, 12), tool_calls: diagnosticCount(get('tool_calls'), 0, 32),
     http_attempts: diagnosticCount(get('http_attempts'), 0, 18),
     artifact_count: diagnosticCount(get('artifact_count'), 0, 128),
+    minimum_output_tokens: diagnosticCount(get('minimum_output_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS),
+    last_response: diagnosticLastResponse(get('last_response')),
+    budget_exhaustion: get('error_code') === 'answer_truncated'
+      ? diagnosticEnum(get('budget_exhaustion'), new Set(['reasoning', 'mixed', 'unknown'])) : null,
   };
   const usage = get('usage');
   return { ...common,
+    ...(action === 'agent_step' ? {
+      task_id_hash: diagnosticRequestFingerprint(undefined, get('task_id_hash')),
+      step_index: diagnosticCount(get('step_index'), null, 12),
+      max_output_tokens: diagnosticCount(get('max_output_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS),
+      reasoning_effort: diagnosticEnum(get('reasoning_effort'), REASONING_EFFORTS),
+    } : {}),
     transport_mode: diagnosticEnum(get('transport_mode'), TRANSPORT_MODES),
     attempts: diagnosticCount(get('attempts'), 0, 3),
     http_status: diagnosticStatus(get('http_status')),
@@ -1043,6 +1092,7 @@ async function main() {
       models: config?.models ?? null,
       capabilities: config?.capabilities ?? null,
       default_reasoning_effort: config?.default_reasoning_effort ?? null,
+      output_budget_policy: config?.output_budget_policy ?? null,
       network_used: false,
       credential_decrypted: false,
     }, options);
@@ -1074,6 +1124,15 @@ async function main() {
     fail('invalid_argument', '--max-output-tokens exceeds the configured model limit.');
   }
   const { thinking, effort } = resolveReasoning(options, config);
+  const budgetPolicy = getOutputBudgetPolicy(config, modelAlias);
+  // An explicit thinking toggle without an effort must not be invented as max.
+  const outputBudget = effort === undefined ? null : assessOutputBudget({
+    reasoningEffort: effort, maxOutputTokens,
+    minMaxReasoningOutputTokens: budgetPolicy.max_reasoning_min_output_tokens,
+  });
+  if (outputBudget && !outputBudget.ok) {
+    fail('output_budget_insufficient', `The max reasoning output budget must be at least ${outputBudget.minimum_output_tokens} tokens; requested ${maxOutputTokens}. No API request was sent.`);
+  }
   const buffer = await readBoundedFile(options.promptFile, profile.max_prompt_bytes, 'prompt');
   const prompt = decodeUtf8(buffer, 'prompt');
   if (!prompt.trim()) fail('prompt_empty', 'The prompt must contain text.');
@@ -1087,6 +1146,7 @@ async function main() {
       max_prompt_bytes: profile.max_prompt_bytes,
       max_response_bytes: profile.max_response_bytes,
       max_output_tokens: maxOutputTokens,
+      output_budget: outputBudget,
       thinking,
       reasoning_effort: effort ?? null,
       timeout_ms: options.timeoutMs,
@@ -1125,4 +1185,4 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import
   });
 }
 
-export { SafeError, loadConfig, loadCredential, request, recordDiagnostic, safeTransportCode, safeStreamResponseReason };
+export { SafeError, loadConfig, loadCredential, request, recordDiagnostic, safeTransportCode, safeStreamResponseReason, assessOutputBudget };

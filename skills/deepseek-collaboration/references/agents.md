@@ -4,6 +4,8 @@
 
 `reasoning_effort` 可为 `none/low/high/max`，缺省读取本地配置。`images` 为明确获准外发的图片 data URL 数组，只按所选路由声明的视觉能力接收；Pro 需额外明确验证。输出默认 4096，最大值取本地路由配置，未配置时最多 8192；绝对上限 393216。最高档工具循环会完整保留提供商要求的内部思考字段，但不向主控或日志暴露。
 
+`max_output_tokens` 是每次模型步骤的共享生成预算，包含思考、答案和工具参数，能力上限不等于默认预算。首次提交应显式规划；小型独立 `max` 任务可参考 16384，代码或多文件可参考 32768，须确认路由上限足够。本机若配置 `output_budget_policy.<alias>.max_reasoning_min_output_tokens`，有效 `max` 且低于阈值会在凭据与 HTTP 前返回 `output_budget_insufficient`，不自动提升。未配置策略保持旧默认；实际截断后不自动扩大预算或重发。详见[预算配置](output-budgets.md)。
+
 parent 真实执行插件后调用 `deepseek_agent_continue({task_id, results:[{request_id, result}]})` 回传。结果 ID 必须全部对应当前一次性 pending；重放、未知、重复均拒绝。`deepseek_agent_status({task_id})` 只返回状态元数据。`deepseek_agent_cancel({task_id})` 阻止后续操作；在途网络可能仍在处理，cancelling 不等于撤销上游费用。
 
 完成返回 `answer`、`artifacts[{path,content,sha256}]`、`steps/tool_calls`，仍需 GPT 验收。会话仅进程内保存，MCP 进程退出/重启后不能继续旧 task。共享 deadline 跨模型轮次与插件等待；默认每模型请求 180s，整任务 360s。`finish_reason` 为 `tool_calls` 表示继续；兼容网关返回带工具调用的 `stop` 时仍继续执行工具，不视为完成。只有无待执行工具、`stop` 且最终内容非空时才可能完成；缺字段、截断或无效响应均失败，不在失败后暗中换模型。
@@ -13,6 +15,8 @@ parent 真实执行插件后调用 `deepseek_agent_continue({task_id, results:[{
 每轮 HTTP 元数据写入本地诊断日志，`agent_step` 的 `ok` 不代表任务完成。请求失败时 `network` 提供过滤后的错误类别、HTTP 状态、耗时和尝试次数；传输错误仅使用允许的短代码。日志不含文件内容、插件参数、答案或原始错误，原始请求 ID 只以哈希保存。
 
 终态另写一次 `agent_task`，包含任务 ID 哈希、状态、受控错误码、预算与计数；终态耗时固定，不随 status 查询增长。失败结果中的 `artifacts` 仅包含此前本任务成功写入且仍通过哈希、路径与大小检查的文件，须按部分交付验收。取消返回元数据，不承诺保留产物；进程重启不恢复旧任务。
+
+步骤日志附任务哈希和序号，可与终态对应。失败结果的 `last_response` 只含最后一轮结束原因与受控 token 数值；截断时 `budget_exhaustion` 按服务商数值标为 `reasoning/mixed/unknown`。这些元数据不证明计费或推理真实性，不包含思考原文。没有成功写入文件时，空 `artifacts` 是未交付的准确状态。
 
 每任务最多 32 条相关插件工具 metadata，由 parent 从实际工具目录挑选注入，不需要使用者手写参数表。模型文字不能增加授权；按原任务权限执行，密钥/登录 cookies/无关私人信息不外发，不可传递结果保留在 parent 侧并返回拒绝或脱敏结果。
 

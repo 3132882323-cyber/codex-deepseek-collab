@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { loadConfig, loadCredential, request, recordDiagnostic, safeTransportCode,
-  safeStreamResponseReason, getModelCapabilities } from './deepseek-client.mjs';
+  safeStreamResponseReason, getModelCapabilities, getOutputBudgetPolicy, assessOutputBudget } from './deepseek-client.mjs';
 
 const KiB = 1024;
 const MiB = KiB * KiB;
@@ -29,12 +29,13 @@ const LOCAL_NAMES = new Set(['list_files', 'read_file', 'write_file']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
 const FINISH_REASONS = new Set(['stop', 'tool_calls', 'length', 'max_tokens',
   'max_output_tokens', 'content_filter', 'function_call', 'insufficient_system_resource', 'aborted']);
+const TRUNCATED_REASONS = new Set(['length', 'max_tokens', 'max_output_tokens']);
 const NETWORK_CATEGORIES = new Set(['timeout', 'cooldown', 'http_status', 'response', 'body', 'transport', 'cancelled', 'ok']);
 const SAFE_ERROR_CODES = new Set([
   'invalid_argument', 'invalid_state', 'task_not_found', 'runtime_disposed',
   'task_limit', 'deadline_exceeded', 'step_limit', 'tool_limit',
   'http_attempt_limit', 'context_too_large', 'model_unavailable', 'model_capability_unavailable',
-  'model_response_invalid', 'answer_incomplete', 'answer_truncated',
+  'model_response_invalid', 'answer_incomplete', 'answer_truncated', 'output_budget_insufficient',
   'tool_call_invalid', 'tool_result_invalid', 'path_refused', 'file_unavailable',
   'file_too_large', 'file_limit', 'scratch_unavailable', 'runtime_failed',
   'configuration_invalid', 'configuration_unavailable', 'credential_unavailable',
@@ -372,13 +373,14 @@ function validateStart(args) {
   return { task: args.task, model: args.model, files, images, pluginTools, maxSteps, maxToolCalls,
     totalTimeoutMs, maxOutputTokens, reasoningEffort: args.reasoning_effort };
 }
-function initialMessages(input, credential) {
+function initialMessages(input, credential, reasoningEffort) {
   const clean = value => credential === undefined ? value : redactKnown(value, credential);
   const catalog = clean(input.pluginTools.map(tool => ({ name: tool.name, description: tool.description,
     input_schema: tool.input_schema ?? { type: 'object' } })));
   return [
     { role: 'system', content: 'You are a DeepSeek agent operating only in an isolated scratch directory. Use list_files, read_file, and write_file for files. Use codex_tool only for the explicitly allowlisted host tools. Never claim a tool ran unless its result was returned. Produce a final nonempty answer when finished. Allowed Codex host tools and their argument schemas: '
-      + JSON.stringify(catalog) },
+      + JSON.stringify(catalog)
+      + ` Each model step has a shared generation limit of ${input.maxOutputTokens} tokens, including reasoning, answer text, and tool arguments; reasoning effort is ${reasoningEffort}. This is a per-step limit, not a task-wide token quota. When files are requested, write complete small deliverables early with write_file instead of postponing all files until a long final answer. Preserve useful completed checkpoints. For text-only tasks answer concisely without inventing file deliverables. Finish with a short nonempty confirmation; do not repeat file contents in the final answer or claim truncated work is complete.` },
     { role: 'user', content: input.images.length
       ? [{ type: 'text', text: clean(input.task) },
         ...input.images.map(image => ({ type: 'image_url', image_url: { url: image.url } }))]
@@ -551,6 +553,21 @@ function safeOutputMetadata(data) {
     reasoning_tokens: safeCount(ownValue(ownValue(usage, 'completion_tokens_details'), 'reasoning_tokens'), null),
   };
 }
+function lastResponse(record) { return record.lastResponse ? { ...record.lastResponse } : null; }
+function budgetExhaustion(record) {
+  if (record.errorCode !== 'answer_truncated') return null;
+  const response = record.lastResponse;
+  // Reported token counts support this narrow inference only when they exactly
+  // fill the budget of the response that actually truncated. A lower total can
+  // also mean a context limit; missing or inconsistent usage remains unknown.
+  if (!response || response.step_index !== record.steps || !TRUNCATED_REASONS.has(response.finish_reason)
+      || response.completion_tokens !== record.maxOutputTokens
+      || !Number.isSafeInteger(response.reasoning_tokens) || response.reasoning_tokens < 0
+      || response.reasoning_tokens > response.completion_tokens) return 'unknown';
+  // "mixed" means some generated tokens were not reasoning. Those tokens can
+  // be tool arguments, so this does not imply a complete or usable final answer.
+  return response.reasoning_tokens === response.completion_tokens ? 'reasoning' : 'mixed';
+}
 function elapsed(record) { return Math.max(0, (record.finishedAt ?? Date.now()) - record.startedAt); }
 function metadata(record) {
   return { state: record.state, task_id: record.id, model: record.modelAlias,
@@ -563,6 +580,9 @@ function view(record) {
     requests: record.pending.requests.map(item => ({ ...item })), artifacts: record.artifacts ?? [] };
   if (record.state === 'completed') return { ...base, answer: record.answer, artifacts: record.artifacts };
   if (record.state === 'failed') return { ...base, error_code: record.errorCode, error: record.error,
+    max_output_tokens: record.maxOutputTokens, last_response: lastResponse(record),
+    ...(record.errorCode === 'output_budget_insufficient' ? { output_budget: { ...record.outputBudget } } : {}),
+    ...(record.errorCode === 'answer_truncated' ? { budget_exhaustion: budgetExhaustion(record) } : {}),
     artifacts: record.artifacts ?? [], ...(record.network ? { network: record.network } : {}) };
   return base;
 }
@@ -687,10 +707,13 @@ export function createAgentRuntime(options = {}) {
     if (ok) {
       try { outputMetadata = safeOutputMetadata(data); }
       catch { outputMetadata = safeOutputMetadata(null); }
+      record.lastResponse = { step_index: record.steps, ...outputMetadata };
     }
     try {
       await writeDiagnostic(stateDir, 'agent_step', record.modelAlias,
-        { ok, ...metadata, ...outputMetadata, transport_mode: record.transportMode, error_code: errorCode });
+        { ok, ...metadata, ...outputMetadata, transport_mode: record.transportMode, error_code: errorCode,
+          task_id_hash: `sha256:${hash(record.id).slice(0, 16)}`, step_index: record.steps,
+          max_output_tokens: record.maxOutputTokens, reasoning_effort: record.reasoningEffort });
     } catch { /* Diagnostic failures cannot change the HTTP step outcome. */ }
     return metadata;
   }
@@ -714,9 +737,11 @@ export function createAgentRuntime(options = {}) {
           task_id_hash: `sha256:${hash(record.id).slice(0, 16)}`,
           reasoning_effort: record.reasoningEffort, total_timeout_ms: record.totalTimeoutMs,
           max_output_tokens: record.maxOutputTokens, max_steps: record.maxSteps,
+          minimum_output_tokens: record.outputBudget?.minimum_output_tokens ?? null,
           max_tool_calls: record.maxToolCalls, max_http_attempts: record.maxHttpAttempts,
           steps: record.steps, tool_calls: record.toolCalls, http_attempts: record.httpAttempts,
           error_code: record.state === 'failed' ? record.errorCode : null,
+          last_response: lastResponse(record), budget_exhaustion: budgetExhaustion(record),
           ...(record.state === 'failed' && record.network?.response_reason
             ? { response_reason: record.network.response_reason } : {}),
           artifact_count: record.artifacts?.length ?? 0, elapsed_ms: elapsed(record),
@@ -800,7 +825,7 @@ export function createAgentRuntime(options = {}) {
         const choice = sanitized?.choices?.[0];
         const message = choice?.message;
         const finish = choice?.finish_reason;
-        const truncated = ['length', 'max_tokens', 'max_output_tokens'].includes(finish);
+        const truncated = TRUNCATED_REASONS.has(finish);
         if (!plain(message)) fail('model_response_invalid', 'The model returned an invalid response.');
         if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
           if (message.content !== null && message.content !== undefined
@@ -897,7 +922,7 @@ export function createAgentRuntime(options = {}) {
       requestAbort: new AbortController(),
       seenCallIds: new Set(), pluginToolNames: new Set(input.pluginTools.map(item => item.name)),
       tools: null, baseline: new Map(), writtenArtifacts: new Map(), pending: null,
-      answer: null, artifacts: null, config: null, credential: null, messages: null,
+      answer: null, artifacts: null, config: null, credential: null, messages: null, lastResponse: null,
       scratchDir: null, network: null };
     records.set(record.id, record);
     let unbind;
@@ -929,6 +954,13 @@ export function createAgentRuntime(options = {}) {
       if (!REASONING_EFFORTS.has(record.reasoningEffort)) {
         fail('configuration_invalid', 'The configured default reasoning effort is invalid.');
       }
+      const budgetPolicy = getOutputBudgetPolicy(record.config, input.model);
+      record.outputBudget = assessOutputBudget({ reasoningEffort: record.reasoningEffort,
+        maxOutputTokens: record.maxOutputTokens,
+        minMaxReasoningOutputTokens: budgetPolicy.max_reasoning_min_output_tokens });
+      if (!record.outputBudget.ok) {
+        fail('output_budget_insufficient', `The max reasoning output budget must be at least ${record.outputBudget.minimum_output_tokens} tokens; requested ${record.maxOutputTokens}. No API request was sent.`);
+      }
       record.credential = await readCredential(record.config, stateDir);
       if (record.cancelled) { markCancelled(record); return await settledView(record); }
       if (typeof record.credential !== 'string' || !record.credential) {
@@ -954,7 +986,7 @@ export function createAgentRuntime(options = {}) {
         await writeText(record, file.path, content);
         record.baseline.set(artifactKey(file.path), hash(content));
       }
-      record.messages = initialMessages(input, record.credential);
+      record.messages = initialMessages(input, record.credential, record.reasoningEffort);
       ensureHistory(record);
       return await drive(record);
     } catch (error) {

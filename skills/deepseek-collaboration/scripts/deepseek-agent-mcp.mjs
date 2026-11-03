@@ -29,7 +29,7 @@ const TOOLS = [
             pattern: '^data:image/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$'},
         },
         reasoning_effort: {type: 'string', enum: ['none', 'low', 'high', 'max'],
-          description: 'Uses the configured default when omitted. none disables thinking; other levels enable it.'},
+          description: 'Uses the configured default when omitted. none disables thinking; other levels enable it. Reasoning shares each step generation budget with answer text and tool arguments; keep the user-selected effort and plan max_output_tokens explicitly.'},
         files: {
           type: 'array',
           maxItems: 128,
@@ -61,7 +61,7 @@ const TOOLS = [
         max_tool_calls: {type: 'integer', minimum: 1, maximum: 32},
         total_timeout_ms: {type: 'integer', minimum: 1, maximum: 900000},
         max_output_tokens: {type: 'integer', minimum: 32, maximum: 393216,
-          description: 'Defaults to 4096; must fit the selected profile cap. Legacy connections without an output profile retain an 8192 maximum.'},
+          description: 'Per-model-step shared generation limit for reasoning, answer and tool arguments. Defaults to 4096; the profile cap is not a default. Before the first max-effort request explicitly plan a budget: 16384 for a small isolated task or 32768 for code/multiple files are examples, not guarantees; respect the route cap and configured minimum. Too-small configured max budgets are refused locally, never silently raised. Actual truncation is not replayed. Legacy routes without an output profile cap at 8192.'},
       },
     },
     annotations: {readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true},
@@ -237,7 +237,7 @@ export function createMcpServer({runtime = createAgentRuntime(), input = process
       sendResult(id, {
         protocolVersion,
         capabilities: {tools: {}},
-        serverInfo: {name: 'codex-deepseek-collab', version: '0.4.0'},
+        serverInfo: {name: 'codex-deepseek-collab', version: '0.5.0'},
         instructions:
           'This server coordinates external Pro/Flash agents. Pending codex_tool requests are executed by the host under existing permission scopes; no credentials are transferred.',
       });

@@ -1,6 +1,6 @@
 {
   "name": "codex-deepseek-collab",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "A portable Codex skill, bounded JSON/SSE client, and DeepSeek Flash MCP worker agents.",
   "license": "MIT",
@@ -14,18 +14,20 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node tests/offline.test.mjs && node --test tests/agent.test.mjs tests/mcp.test.mjs tests/capabilities.test.mjs tests/client-capabilities.test.mjs tests/transport-diagnostics.test.mjs tests/stream.test.mjs",
-    "check": "node --check skills/deepseek-collaboration/scripts/deepseek-client.mjs && node --check skills/deepseek-collaboration/scripts/deepseek-stream.mjs && node --check skills/deepseek-collaboration/scripts/deepseek-agent-runtime.mjs && node --check skills/deepseek-collaboration/scripts/deepseek-agent-mcp.mjs && node --check skills/deepseek-collaboration/scripts/configure.mjs && node --check tests/offline.test.mjs && node --check tests/agent.test.mjs && node --check tests/mcp.test.mjs && node --check tests/mcp-client.mjs && node --check tests/capabilities.test.mjs && node --check tests/client-capabilities.test.mjs && node --check tests/transport-diagnostics.test.mjs && node --check tests/stream.test.mjs"
+    "test": "node tests/offline.test.mjs && node --test tests/agent.test.mjs tests/mcp.test.mjs tests/capabilities.test.mjs tests/client-capabilities.test.mjs tests/transport-diagnostics.test.mjs tests/stream.test.mjs tests/budget.test.mjs tests/output-budget-integration.test.mjs",
+    "check": "node --check skills/deepseek-collaboration/scripts/deepseek-client.mjs && node --check skills/deepseek-collaboration/scripts/deepseek-budget.mjs && node --check skills/deepseek-collaboration/scripts/deepseek-stream.mjs && node --check skills/deepseek-collaboration/scripts/deepseek-agent-runtime.mjs && node --check skills/deepseek-collaboration/scripts/deepseek-agent-mcp.mjs && node --check skills/deepseek-collaboration/scripts/configure.mjs && node --check tests/offline.test.mjs && node --check tests/agent.test.mjs && node --check tests/mcp.test.mjs && node --check tests/mcp-client.mjs && node --check tests/capabilities.test.mjs && node --check tests/client-capabilities.test.mjs && node --check tests/transport-diagnostics.test.mjs && node --check tests/stream.test.mjs && node --check tests/budget.test.mjs && node --check tests/output-budget-integration.test.mjs"
   },
   "files": [
     "ci/offline-tests.yml",
     "skills/deepseek-collaboration/SKILL.md",
     "skills/deepseek-collaboration/agents/openai.yaml",
     "skills/deepseek-collaboration/scripts/deepseek-client.mjs",
+    "skills/deepseek-collaboration/scripts/deepseek-budget.mjs",
     "skills/deepseek-collaboration/scripts/deepseek-stream.mjs",
     "skills/deepseek-collaboration/scripts/deepseek-agent-runtime.mjs",
     "skills/deepseek-collaboration/scripts/deepseek-agent-mcp.mjs",
     "skills/deepseek-collaboration/references/agents.md",
+    "skills/deepseek-collaboration/references/output-budgets.md",
     "skills/deepseek-collaboration/scripts/configure.mjs",
     "skills/deepseek-collaboration/scripts/configure-windows.ps1",
     "skills/deepseek-collaboration/references/connection.example.json",
@@ -36,6 +38,8 @@
     "tests/client-capabilities.test.mjs",
     "tests/transport-diagnostics.test.mjs",
     "tests/stream.test.mjs",
+    "tests/budget.test.mjs",
+    "tests/output-budget-integration.test.mjs",
     "tests/mcp-client.mjs",
     "README.md",
     "CHANGELOG.md",
@@ -46,6 +50,7 @@
     "examples/expected-rows.json",
     "examples/validate-result.mjs",
     "docs/reliability.md",
+    "docs/output-budgets.md",
     "docs/capabilities.md",
     "docs/workflows.md",
     "LICENSE"

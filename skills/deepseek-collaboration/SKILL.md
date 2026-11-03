@@ -11,6 +11,8 @@ description: Use DeepSeek Flash to offload substantial divisible work that can b
 
 思考强度和模型能力从本地 `default_reasoning_effort`、`capabilities` 读取。保持用户指定的 `max` 默认；每任务输出按需要预算，不能把容量上限当作每次生成量。推理与答案共享输出预算，长任务先拆成独立可验收文件、小批次交付，最终答复只列文件与校验摘要。预算不足时停止并记录，不自动加大预算重发。图片只使用明确获准提供的 data URL，检查所选路由的视觉能力，不因图片或失败自动换模型。
 
+首次提交前明确选择每轮 `max_output_tokens`，计入思考、答案和工具参数。先读取所选路由的 `output_budget_policy` 最小值与能力上限；小型独立 `max` 任务可参考 16384，代码或多文件任务可参考 32768，均需按任务规划并受路由上限约束，不保证足够。通用默认仍是 4096，不能直接套用于所有 `max` 任务。已配置的最低预算不足时在凭据与 HTTP 前拒绝；不要降低用户指定的思考强度绕过它，也不把实际截断改写成自动扩容重试。配置和拒绝处理见[预算参考](references/output-budgets.md)。
+
 ## 路由原则
 - 优先使用已加载的 MCP 工具 `deepseek_agent_start/continue/status/cancel` 执行。工具是真实调用；MCP 未加载时不得声称已调用。
 - 文本-only 产出可明确选择现有 CLI `ask`；不要在 agent 失败后自动改发 `ask`。
@@ -30,10 +32,10 @@ description: Use DeepSeek Flash to offload substantial divisible work that can b
 ## 文本任务调用模板
 
 ```bash
-node "<skill-directory>/scripts/deepseek-client.mjs" ask --prompt-file "<workspace>/work/task.txt" --model flash --max-output-tokens 4096 --output "<workspace>/work/result.json"
+node "<skill-directory>/scripts/deepseek-client.mjs" ask --prompt-file "<workspace>/work/task.txt" --model flash --max-output-tokens "<planned-budget>" --output "<workspace>/work/result.json"
 ```
 
-先检查进程退出码为 0，再判断输出 `ok:true`、`finish_reason:"stop"` 且 `answer` 非空。三项不全不得视为成功。
+将 `<planned-budget>` 替换为首次规划的整数预算。先检查进程退出码为 0，再判断输出 `ok:true`、`finish_reason:"stop"` 且 `answer` 非空。三项不全不得视为成功。
 
 ## MCP 未加载
 参考 `references/agents.md`。不得跨 MCP 进程恢复旧 task；不复制凭据；配置由用户预先完成。
