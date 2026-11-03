@@ -148,6 +148,11 @@ test('MCP initializes, advertises exactly four tools, accepts initialized, and a
     assert.equal(typeof tool.description, 'string');
     assert.equal(tool.inputSchema?.type, 'object');
   }
+  const continuation=listing.result.tools.find(tool=>tool.name==='deepseek_agent_continue').inputSchema;
+  assert.deepEqual(continuation.required,['task_id']);
+  assert.equal(continuation.properties.additional_steps.maximum,12);
+  assert.equal(continuation.properties.additional_tool_calls.maximum,24);
+  assert.equal(continuation.properties.extend_timeout_ms.maximum,360000);
   const ping = await connection.rpc('ping', undefined, 0);
   assert.equal(ping.id, 0);
   assert.deepEqual(ping.result, {});
@@ -282,7 +287,7 @@ test('MCP supports status and cancellation while another tool request is in flig
   assert.equal(toolPayload(await continued).state, 'cancelled');
 });
 
-test('real runtime plus MCP produces a file after one explicit broker round trip', async t => {
+test('real runtime plus MCP resumes the same checkpoint after one explicit broker round trip', async t => {
   const base = ownedTemp(t);
   const stateDir = join(base, 'state');
   mkdirSync(stateDir);
@@ -309,15 +314,22 @@ test('real runtime plus MCP produces a file after one explicit broker round trip
   const connection = inMemory(t, runtime);
   await initialize(connection);
   const waiting = toolPayload(await connection.rpc('tools/call', { name: 'deepseek_agent_start', arguments: {
-    task: 'Create a JavaScript double function using the recipe.', model: 'flash',
+    task: 'Create a JavaScript double function using the recipe.', model: 'flash', max_steps: 1,
     plugin_tools: [{ name: 'get_recipe', description: 'Return a synthetic requested recipe.', input_schema: { type: 'object' } }],
   } }));
   assert.equal(waiting.state, 'waiting_for_tools');
   assert.equal(calls.length, 1);
   assert.equal(waiting.requests[0].tool_name, 'get_recipe');
-  const done = toolPayload(await connection.rpc('tools/call', { name: 'deepseek_agent_continue', arguments: {
+  const paused = toolPayload(await connection.rpc('tools/call', { name: 'deepseek_agent_continue', arguments: {
     task_id: waiting.task_id, results: [{ request_id: waiting.requests[0].request_id, result: { instruction: 'multiply by 2' } }],
   } }));
+  assert.equal(paused.state,'paused');
+  assert.equal(paused.pause_reason,'step_limit');
+  assert.equal(paused.task_id,waiting.task_id);
+  assert.equal(calls.length,1);
+  const done=toolPayload(await connection.rpc('tools/call',{name:'deepseek_agent_continue',arguments:{
+    task_id:paused.task_id,additional_steps:2,
+  }}));
   assert.equal(done.state, 'completed');
   assert.equal(calls.length, 3);
   const artifact = done.artifacts.find(item => item.path === 'dist/double.mjs');

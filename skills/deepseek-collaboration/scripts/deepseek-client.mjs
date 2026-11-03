@@ -9,6 +9,7 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { readChatCompletionStream, StreamResponseError, safeStreamResponseReason } from './deepseek-stream.mjs';
 import { assessOutputBudget } from './deepseek-budget.mjs';
+import { decideTransientRetry } from './deepseek-retry-policy.mjs';
 
 const MAX_PROMPT_BYTES = 128 * 1024;
 const EXTENDED_MAX_PROMPT_BYTES = 2 * 1024 * 1024;
@@ -363,6 +364,7 @@ async function loadConfig(stateDir, optional = false) {
   const capabilities = parseCapabilities(raw.capabilities, raw.models);
   const outputBudgetPolicy = parseOutputBudgetPolicy(raw.output_budget_policy,
     { models: raw.models, ...(capabilities === null ? {} : { capabilities }) });
+  const retryPolicy = getRetryPolicy(raw);
   base.pathname = base.pathname.replace(/\/+$/, '');
   return {
     base_url: base.href.replace(/\/$/, ''),
@@ -374,9 +376,20 @@ async function loadConfig(stateDir, optional = false) {
     credential_source: credentialSource,
     ...(capabilities === null ? {} : { capabilities }),
     ...(outputBudgetPolicy === null ? {} : { output_budget_policy: outputBudgetPolicy }),
+    ...(raw.retry_policy === undefined ? {} : { retry_policy: retryPolicy }),
     ...(raw.default_reasoning_effort === undefined ? {}
       : { default_reasoning_effort: raw.default_reasoning_effort }),
   };
+}
+
+export function getRetryPolicy(config) {
+  const policy = config?.retry_policy;
+  if (policy === undefined) return { retry_transient_transport: false };
+  if (!plainObject(policy) || Object.keys(policy).some(key => key !== 'retry_transient_transport')
+      || typeof policy.retry_transient_transport !== 'boolean') {
+    fail('configuration_invalid', 'The transport retry policy must contain an explicit boolean.');
+  }
+  return { retry_transient_transport: policy.retry_transient_transport };
 }
 
 async function credentialMetadata(config, stateDir) {
@@ -570,9 +583,10 @@ function retryDecision(status, attempt, policy, elapsed, retryAfter) {
   return { retry: true, delayMs, reason: 'retry' };
 }
 
-async function withHardTimeout(work, timeoutMs, onTimeout) {
+async function withHardTimeout(work, timeoutMs, onTimeout, cancellationSignal) {
+  if (cancellationSignal?.aborted) throw requestCancelled();
   const controller = new AbortController();
-  let timer;
+  let timer, onCancel;
   const deadline = new Promise((_, reject) => {
     timer = setTimeout(() => {
       reject(new SafeError('request_timeout', 'The API request timed out; its outcome is unknown.'));
@@ -580,10 +594,20 @@ async function withHardTimeout(work, timeoutMs, onTimeout) {
       try { onTimeout(); } catch { /* Cancellation must not block the deadline. */ }
     }, timeoutMs);
   });
+  const cancellation = new Promise((_, reject) => {
+    onCancel = () => {
+      reject(requestCancelled());
+      controller.abort();
+      try { onTimeout(); } catch { /* Cancellation cleanup cannot block the caller. */ }
+    };
+    cancellationSignal?.addEventListener('abort', onCancel, { once: true });
+    if (cancellationSignal?.aborted) onCancel();
+  });
   try {
-    return await Promise.race([work(controller.signal), deadline]);
+    return await Promise.race([controller.signal.aborted ? cancellation : work(controller.signal), deadline, cancellation]);
   } finally {
     clearTimeout(timer);
+    cancellationSignal?.removeEventListener('abort', onCancel);
     controller.abort();
   }
 }
@@ -603,6 +627,7 @@ function networkMetadata(startedAt, attempts, status, requestId, history, catego
 
 async function request(config, path, credential, body, policy, control = {}) {
   const startedAt = performance.now();
+  const retryEnabled = getRetryPolicy(config).retry_transient_transport;
   if (!plainObject(control) || control.signal !== undefined
       && (typeof control.signal?.aborted !== 'boolean'
         || typeof control.signal.addEventListener !== 'function'
@@ -676,7 +701,7 @@ async function request(config, path, credential, body, policy, control = {}) {
           }
           throw error;
         }
-      }, attemptTimeout, () => cancelResponseBody(response));
+      }, attemptTimeout, () => cancelResponseBody(response), cancellationSignal);
       checkCancelled(attempt);
 
       if (!response.ok) {
@@ -716,11 +741,34 @@ async function request(config, path, credential, body, policy, control = {}) {
         : error instanceof SafeError && error.code === 'retry_budget_exhausted' || isTimeout ? 'timeout'
           : error instanceof SafeError && error.code === 'api_http_error' ? 'http_status'
             : error instanceof SafeError ? 'response' : response?.ok ? 'body' : 'transport';
+      const transportCode = cancelled ? null : safeTransportCode(error);
+      // A malformed/truncated semantic response cannot become retryable merely
+      // because it carries an unrelated transport cause or error name.
+      const retryCategory = cancelled ? 'cancelled'
+        : error instanceof SafeError ? error.code === 'request_timeout' ? 'timeout' : 'response'
+          : response?.ok ? 'body' : 'transport';
+      const transient = decideTransientRetry({ enabled: retryEnabled, code: transportCode,
+        category: retryCategory, attempt, maxAttempts: policy.maxAttempts,
+        elapsedMs: Math.floor(elapsedExactMs(startedAt)), totalTimeoutMs: Math.floor(policy.totalTimeoutMs),
+        retryBaseMs: policy.retryBaseMs, retryMaxMs: policy.retryMaxMs, cancelled: Boolean(cancelled) });
       if (history.at(-1)?.attempt !== attempt) {
         history.push({ attempt, status: lastStatus, category, delay_ms: 0,
           elapsed_ms: elapsedMs(startedAt), request_id: lastRequestId });
       }
-      const transportCode = cancelled ? null : safeTransportCode(error);
+      if (transient.retry) {
+        history.at(-1).delay_ms = transient.delay_ms;
+        checkCancelled(attempt);
+        try {
+          await waitForRetry(transient.delay_ms, cancellationSignal);
+        } catch (waitError) {
+          // This branch is already in the request catch: retain cancellation
+          // diagnostics rather than letting a bare backoff rejection escape.
+          checkCancelled(attempt);
+          throw waitError;
+        }
+        checkCancelled(attempt);
+        continue;
+      }
       const metadata = networkMetadata(startedAt, attempt, lastStatus, lastRequestId, history,
         category, transportCode, transportMode);
       const responseReason = error instanceof SafeError && ['response_invalid', 'response_too_large'].includes(ownDataValue(error, 'code'))
@@ -941,7 +989,7 @@ function diagnosticHistory(value) {
 
 function diagnosticLastResponse(value) {
   const get = key => ownDataValue(value, key);
-  const step = diagnosticCount(get('step_index'), null, 12);
+  const step = diagnosticCount(get('step_index'), null, 48);
   if (!step) return null;
   return { step_index: step,
     finish_reason: diagnosticEnum(get('finish_reason'), DIAGNOSTIC_FINISH_REASONS),
@@ -966,13 +1014,13 @@ function diagnosticEntry(action, model, result) {
     state: diagnosticEnum(get('state'), DIAGNOSTIC_TASK_STATES),
     task_id_hash: diagnosticRequestFingerprint(undefined, get('task_id_hash')),
     reasoning_effort: diagnosticEnum(get('reasoning_effort'), REASONING_EFFORTS),
-    total_timeout_ms: diagnosticCount(get('total_timeout_ms'), null, MAX_TOTAL_TIMEOUT_MS),
+    total_timeout_ms: diagnosticCount(get('total_timeout_ms'), null, 1_800_000),
     max_output_tokens: diagnosticCount(get('max_output_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS),
-    max_steps: diagnosticCount(get('max_steps'), null, 12),
-    max_tool_calls: diagnosticCount(get('max_tool_calls'), null, 32),
-    max_http_attempts: diagnosticCount(get('max_http_attempts'), null, 18),
-    steps: diagnosticCount(get('steps'), 0, 12), tool_calls: diagnosticCount(get('tool_calls'), 0, 32),
-    http_attempts: diagnosticCount(get('http_attempts'), 0, 18),
+    max_steps: diagnosticCount(get('max_steps'), null, 48),
+    max_tool_calls: diagnosticCount(get('max_tool_calls'), null, 96),
+    max_http_attempts: diagnosticCount(get('max_http_attempts'), null, 144),
+    steps: diagnosticCount(get('steps'), 0, 48), tool_calls: diagnosticCount(get('tool_calls'), 0, 96),
+    http_attempts: diagnosticCount(get('http_attempts'), 0, 144),
     artifact_count: diagnosticCount(get('artifact_count'), 0, 128),
     minimum_output_tokens: diagnosticCount(get('minimum_output_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS),
     last_response: diagnosticLastResponse(get('last_response')),
@@ -983,7 +1031,7 @@ function diagnosticEntry(action, model, result) {
   return { ...common,
     ...(action === 'agent_step' ? {
       task_id_hash: diagnosticRequestFingerprint(undefined, get('task_id_hash')),
-      step_index: diagnosticCount(get('step_index'), null, 12),
+      step_index: diagnosticCount(get('step_index'), null, 48),
       max_output_tokens: diagnosticCount(get('max_output_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS),
       reasoning_effort: diagnosticEnum(get('reasoning_effort'), REASONING_EFFORTS),
     } : {}),
@@ -1065,7 +1113,7 @@ let safeOutputOptions = null;
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.help) {
-    process.stdout.write('Usage:\n  deepseek-client.mjs [--state-dir PATH] status\n  deepseek-client.mjs [--state-dir PATH] models\n  deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [--model flash|pro] [--thinking disabled|enabled] [--reasoning-effort none|low|high|max] [--max-output-tokens 32..393216] [--timeout-ms N] [--total-timeout-ms N] [--max-attempts 1..3] [--retry-base-ms 1..10000] [--retry-max-ms 1..60000] [--output PATH] [--dry-run]\n\nask defaults: thinking disabled, 4096 generated tokens, 180000 ms per attempt, 360000 ms total, 3 attempts, 1000..10000 ms bounded retry wait. Legacy configurations allow 8192 maximum output tokens and 128 KiB UTF-8 prompts; configured capabilities may raise these limits.\nOnly explicit HTTP 429/500/502/503/504 responses are retryable. A POST timeout or transport failure is never replayed.\nstatus and --dry-run never decrypt credentials or use the network.\n--dry-run only prints metadata and never writes an --output target.\n');
+    process.stdout.write('Usage:\n  deepseek-client.mjs [--state-dir PATH] status\n  deepseek-client.mjs [--state-dir PATH] models\n  deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [--model flash|pro] [--thinking disabled|enabled] [--reasoning-effort none|low|high|max] [--max-output-tokens 32..393216] [--timeout-ms N] [--total-timeout-ms N] [--max-attempts 1..3] [--retry-base-ms 1..10000] [--retry-max-ms 1..60000] [--output PATH] [--dry-run]\n\nask defaults: thinking disabled, 4096 generated tokens, 180000 ms per attempt, 360000 ms total, 3 attempts, 1000..10000 ms bounded retry wait. Legacy configurations allow 8192 maximum output tokens and 128 KiB UTF-8 prompts; configured capabilities may raise these limits.\nExplicit HTTP 429/500/502/503/504 responses are retryable. Opt in to transient socket and local timeout retries with connection.json retry_policy.retry_transient_transport=true; they share the same attempt and time budgets. Invalid or truncated responses are never replayed. Provider work may already have run.\nstatus and --dry-run never decrypt credentials or use the network.\n--dry-run only prints metadata and never writes an --output target.\n');
     return;
   }
   if (options.action === 'ask' && options.output && !options.dryRun) {
@@ -1093,6 +1141,7 @@ async function main() {
       capabilities: config?.capabilities ?? null,
       default_reasoning_effort: config?.default_reasoning_effort ?? null,
       output_budget_policy: config?.output_budget_policy ?? null,
+      retry_policy: getRetryPolicy(config),
       network_used: false,
       credential_decrypted: false,
     }, options);
@@ -1141,6 +1190,7 @@ async function main() {
       ok: true,
       dry_run: true,
       transport_mode: config.transport_mode,
+      retry_transient_transport: getRetryPolicy(config).retry_transient_transport,
       model_requested: model,
       prompt_bytes: buffer.byteLength,
       max_prompt_bytes: profile.max_prompt_bytes,

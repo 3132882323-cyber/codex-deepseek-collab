@@ -1,8 +1,8 @@
 {
   "name": "codex-deepseek-collab",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
-  "description": "DeepSeek Flash native Codex sessions with a Responses guard, plus GPT and Flash MCP collaboration.",
+  "description": "Same-chat GPT and DeepSeek Flash collaboration with bounded retries, progress checkpoints and host tool mediation.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -14,7 +14,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node tests/offline.test.mjs && node --test tests/agent.test.mjs tests/mcp.test.mjs tests/capabilities.test.mjs tests/client-capabilities.test.mjs tests/transport-diagnostics.test.mjs tests/stream.test.mjs tests/budget.test.mjs tests/output-budget-integration.test.mjs tests/native-core.test.mjs tests/native-guard.test.mjs tests/native-tools.test.mjs",
+    "test": "node tests/offline.test.mjs && node --test tests/agent.test.mjs tests/agent-recovery.test.mjs tests/retry-policy.test.mjs tests/client-recovery.test.mjs tests/mcp.test.mjs tests/capabilities.test.mjs tests/client-capabilities.test.mjs tests/transport-diagnostics.test.mjs tests/stream.test.mjs tests/budget.test.mjs tests/output-budget-integration.test.mjs tests/native-core.test.mjs tests/native-guard.test.mjs tests/native-tools.test.mjs",
     "check": "node scripts/check-syntax.mjs"
   },
   "files": [
@@ -23,6 +23,7 @@
     "skills/deepseek-collaboration/SKILL.md",
     "skills/deepseek-collaboration/agents/openai.yaml",
     "skills/deepseek-collaboration/scripts/deepseek-client.mjs",
+    "skills/deepseek-collaboration/scripts/deepseek-retry-policy.mjs",
     "skills/deepseek-collaboration/scripts/deepseek-budget.mjs",
     "skills/deepseek-collaboration/scripts/deepseek-native.mjs",
     "skills/deepseek-collaboration/scripts/deepseek-native-core.mjs",
@@ -40,6 +41,9 @@
     "skills/deepseek-collaboration/references/connection.example.json",
     "tests/offline.test.mjs",
     "tests/agent.test.mjs",
+    "tests/agent-recovery.test.mjs",
+    "tests/retry-policy.test.mjs",
+    "tests/client-recovery.test.mjs",
     "tests/mcp.test.mjs",
     "tests/capabilities.test.mjs",
     "tests/client-capabilities.test.mjs",
@@ -61,6 +65,7 @@
     "examples/expected-rows.json",
     "examples/validate-result.mjs",
     "docs/reliability.md",
+    "docs/recovery-checklist.md",
     "docs/native-codex.md",
     "docs/output-budgets.md",
     "docs/capabilities.md",

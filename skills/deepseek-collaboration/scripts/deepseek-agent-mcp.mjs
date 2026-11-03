@@ -57,8 +57,8 @@ const TOOLS = [
             },
           },
         },
-        max_steps: {type: 'integer', minimum: 1, maximum: 12},
-        max_tool_calls: {type: 'integer', minimum: 1, maximum: 32},
+        max_steps: {type: 'integer', minimum: 1, maximum: 12, description: 'Initial phase limit, default 12. Reaching it pauses with artifacts; continue the same task with an explicit bounded recovery budget.'},
+        max_tool_calls: {type: 'integer', minimum: 1, maximum: 32, description: 'Initial phase limit, default 24. A validated batch that cannot fit is retained without executing it until explicitly resumed.'},
         total_timeout_ms: {type: 'integer', minimum: 1, maximum: 900000},
         max_output_tokens: {type: 'integer', minimum: 32, maximum: 393216,
           description: 'Per-model-step shared generation limit for reasoning, answer and tool arguments. Defaults to 4096; the profile cap is not a default. Before the first max-effort request explicitly plan a budget: 16384 for a small isolated task or 32768 for code/multiple files are examples, not guarantees; respect the route cap and configured minimum. Too-small configured max budgets are refused locally, never silently raised. Actual truncation is not replayed. Legacy routes without an output profile cap at 8192.'},
@@ -69,16 +69,16 @@ const TOOLS = [
   {
     name: 'deepseek_agent_continue',
     description:
-      'Provide results for pending Codex plugin tool requests from an external agent and continue it. The host executes the requested plugin tools under existing permission scopes.',
+      'Continue the same external agent task. For waiting_for_tools, provide exact pending plugin results once under existing permissions. For paused step/tool limits, omit results and explicitly add the needed budget; committed tools are not repeated. In-memory checkpoints require the same MCP process. Never restart a failed/truncated task as an automatic retry.',
     inputSchema: {
       type: 'object',
-      required: ['task_id', 'results'],
+      required: ['task_id'],
       additionalProperties: false,
       properties: {
         task_id: {type: 'string'},
         results: {
           type: 'array',
-          minItems: 1,
+          minItems: 0,
           maxItems: 32,
           items: {
             type: 'object',
@@ -90,13 +90,16 @@ const TOOLS = [
             },
           },
         },
+        additional_steps: {type: 'integer', minimum: 1, maximum: 12, description: 'Paused tasks only; cumulative hard limit 48 model steps.'},
+        additional_tool_calls: {type: 'integer', minimum: 1, maximum: 24, description: 'Paused tasks only; cumulative hard limit 96 tool calls. An oversized pending batch stays paused until enough credits exist.'},
+        extend_timeout_ms: {type: 'integer', minimum: 1, maximum: 360000, description: 'Paused tasks only; extend the original deadline before it expires. Cumulative task deadline cannot exceed 30 minutes from start.'},
       },
     },
     annotations: {readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true},
   },
   {
     name: 'deepseek_agent_status',
-    description: 'Report the current state of an external agent task.',
+    description: 'Report task state. Paused tasks include validated artifacts and available recovery budgets for continuing the same task ID in this MCP process.',
     inputSchema: {
       type: 'object',
       required: ['task_id'],
@@ -237,7 +240,7 @@ export function createMcpServer({runtime = createAgentRuntime(), input = process
       sendResult(id, {
         protocolVersion,
         capabilities: {tools: {}},
-        serverInfo: {name: 'codex-deepseek-collab', version: '0.6.0'},
+        serverInfo: {name: 'codex-deepseek-collab', version: '0.7.0'},
         instructions:
           'This server coordinates external Pro/Flash agents. Pending codex_tool requests are executed by the host under existing permission scopes; no credentials are transferred.',
       });

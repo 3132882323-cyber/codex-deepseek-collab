@@ -25,6 +25,10 @@ const MAX_TOTAL_IMAGE_BYTES = 4 * MiB;
 const PLUGIN_TOOLS_LIMIT = 64 * KiB;
 const MAX_TASKS = 16;
 const MAX_FILES = 128;
+const MAX_CUMULATIVE_STEPS = 48;
+const MAX_CUMULATIVE_TOOL_CALLS = 96;
+const MAX_CUMULATIVE_HTTP_ATTEMPTS = 144;
+const MAX_CUMULATIVE_TIMEOUT_MS = 1_800_000;
 const LOCAL_NAMES = new Set(['list_files', 'read_file', 'write_file']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
 const FINISH_REASONS = new Set(['stop', 'tool_calls', 'length', 'max_tokens',
@@ -332,8 +336,8 @@ function validateImages(value) {
 function validateStart(args) {
   if (!plain(args) || typeof args.task !== 'string' || !args.task.trim() || bytes(args.task) > EXTENDED_LIMITS.task
       || !['flash', 'pro'].includes(args.model)) fail('invalid_argument', 'A bounded task and model alias are required.');
-  const maxSteps = boundedInteger(args.max_steps, 'max_steps', 6, 1, 12);
-  const maxToolCalls = boundedInteger(args.max_tool_calls, 'max_tool_calls', 12, 1, 32);
+  const maxSteps = boundedInteger(args.max_steps, 'max_steps', 12, 1, 12);
+  const maxToolCalls = boundedInteger(args.max_tool_calls, 'max_tool_calls', 24, 1, 32);
   const totalTimeoutMs = boundedInteger(args.total_timeout_ms, 'total_timeout_ms', 360_000, 1, 900_000);
   const maxOutputTokens = boundedInteger(args.max_output_tokens, 'max_output_tokens', 4096, 32, MAX_OUTPUT_TOKENS);
   if (args.reasoning_effort !== undefined && !REASONING_EFFORTS.has(args.reasoning_effort)) {
@@ -417,7 +421,6 @@ function validateToolCalls(record, rawCalls) {
   if (!Array.isArray(rawCalls) || !rawCalls.length || rawCalls.length > 32) {
     fail('tool_call_invalid', 'The model returned an invalid tool batch.');
   }
-  if (record.toolCalls + rawCalls.length > record.maxToolCalls) fail('tool_limit', 'The tool call limit was reached.');
   const ids = new Set();
   const calls = [];
   for (const raw of rawCalls) {
@@ -574,8 +577,34 @@ function metadata(record) {
     steps: record.steps, tool_calls: record.toolCalls, http_attempts: record.httpAttempts,
     elapsed_ms: elapsed(record) };
 }
+function recoveryMetadata(record) {
+  const pendingCalls = record.pending?.calls.length ?? 0;
+  return {
+    same_process_only: true,
+    can_resume: record.pauseReason === 'step_limit'
+      ? record.maxSteps < MAX_CUMULATIVE_STEPS
+      : record.toolCalls + pendingCalls <= MAX_CUMULATIVE_TOOL_CALLS
+        && record.maxToolCalls < MAX_CUMULATIVE_TOOL_CALLS,
+    resume_count: record.recoveryCount,
+    budget_added: record.lastBudgetAddition !== null,
+    last_budget_addition: record.lastBudgetAddition ? { ...record.lastBudgetAddition } : null,
+    max_steps: record.maxSteps, max_tool_calls: record.maxToolCalls,
+    max_http_attempts: record.maxHttpAttempts, total_timeout_ms: record.totalTimeoutMs,
+    remaining_steps: Math.max(0, record.maxSteps - record.steps),
+    remaining_tool_calls: Math.max(0, record.maxToolCalls - record.toolCalls),
+    remaining_http_attempts: Math.max(0, record.maxHttpAttempts - record.httpAttempts),
+    remaining_timeout_ms: Math.max(0, record.deadlineAt - Date.now()),
+    additional_steps_available: MAX_CUMULATIVE_STEPS - record.maxSteps,
+    additional_tool_calls_available: MAX_CUMULATIVE_TOOL_CALLS - record.maxToolCalls,
+    extend_timeout_ms_available: MAX_CUMULATIVE_TIMEOUT_MS - record.totalTimeoutMs,
+    pending_tool_calls: pendingCalls,
+  };
+}
 function view(record) {
   const base = metadata(record);
+  if (record.state === 'paused') return { ...base, pause_reason: record.pauseReason,
+    recovery: recoveryMetadata(record), artifacts: record.artifacts ?? [],
+    max_output_tokens: record.maxOutputTokens, last_response: lastResponse(record) };
   if (record.state === 'waiting_for_tools') return { ...base,
     requests: record.pending.requests.map(item => ({ ...item })), artifacts: record.artifacts ?? [] };
   if (record.state === 'completed') return { ...base, answer: record.answer, artifacts: record.artifacts };
@@ -594,12 +623,14 @@ function markFailed(record, error) {
   record.error = safe.message;
   record.messages = null;
   record.pending = null;
+  record.pauseReason = null;
   record.credential = null;
 }
 function markCancelled(record) {
   record.state = 'cancelled';
   record.finishedAt ??= Date.now();
   record.pending = null;
+  record.pauseReason = null;
   record.messages = null;
   record.credential = null;
 }
@@ -785,17 +816,63 @@ export function createAgentRuntime(options = {}) {
     return records.get(taskId);
   };
 
+  async function pause(record, reason) {
+    // The provider-only history and credential remain in this process. Only
+    // committed, still-valid files and numeric recovery metadata reach the host.
+    record.artifacts = await recoverArtifacts(record);
+    if (!checkActive(record)) return await settledView(record);
+    record.pauseReason = reason;
+    record.state = 'paused';
+    return view(record);
+  }
+
+  async function executePendingBatch(record) {
+    const pending = record.pending;
+    if (!pending.counted) {
+      if (record.toolCalls + pending.calls.length > record.maxToolCalls) {
+        return await pause(record, 'tool_limit');
+      }
+      // Reserve the whole batch before its first side effect. Its saved result
+      // map prevents completed local tools from ever being dispatched twice.
+      record.toolCalls += pending.calls.length;
+      for (const call of pending.calls) record.seenCallIds.add(call.id);
+      pending.counted = true;
+    }
+    const requested = new Set(pending.requests.map(item => item.request_id));
+    for (const call of pending.calls) {
+      if (!checkActive(record)) return await settledView(record);
+      if (pending.results.has(call.id) || requested.has(call.id)) continue;
+      if (call.name === 'codex_tool') {
+        pending.requests.push({ request_id: call.id, tool_name: call.args.name, arguments: call.args.arguments });
+        requested.add(call.id);
+      } else pending.results.set(call.id, await localTool(record, call));
+    }
+    if (pending.requests.length) {
+      record.artifacts = await collectArtifacts(record);
+      if (!checkActive(record)) return await settledView(record);
+      record.state = 'waiting_for_tools';
+      return view(record);
+    }
+    for (const call of pending.calls) record.messages.push(toolMessage(call.id, pending.results.get(call.id)));
+    record.pending = null;
+    return null;
+  }
+
   async function drive(record) {
     record.busy = true;
     try {
       while (true) {
         if (!checkActive(record)) return await settledView(record);
-        if (record.steps >= record.maxSteps) fail('step_limit', 'The model step limit was reached.');
-        if (record.httpAttempts >= record.maxHttpAttempts) fail('http_attempt_limit', 'The HTTP attempt limit was reached.');
+        if (record.pending) {
+          const result = await executePendingBatch(record);
+          if (result) return result;
+        }
         ensureHistory(record);
+        if (record.steps >= record.maxSteps) return await pause(record, 'step_limit');
+        if (record.httpAttempts >= record.maxHttpAttempts) fail('http_attempt_limit', 'The HTTP attempt limit was reached.');
         const remaining = record.deadlineAt - Date.now();
         const policy = { timeoutMs: Math.max(1, Math.min(180_000, remaining)),
-          totalTimeoutMs: Math.max(1, remaining),
+          totalTimeoutMs: Math.max(1, Math.min(360_000, remaining)),
           maxAttempts: Math.min(3, record.maxHttpAttempts - record.httpAttempts),
           retryBaseMs: 1000, retryMaxMs: 10_000, maxResponseBytes: record.maxResponseBytes };
         const body = { model: record.modelId, messages: record.messages, tools: record.tools,
@@ -844,27 +921,7 @@ export function createAgentRuntime(options = {}) {
           const assistant = assistantMessage({ ...message, tool_calls: cleanCalls }, record.reasoningEffort !== 'none');
           safeJson([...record.messages, assistant], record.limits.history, 'context_too_large');
           record.messages.push(assistant);
-          record.toolCalls += calls.length;
-          for (const call of calls) record.seenCallIds.add(call.id);
-          const results = new Map();
-          const requests = [];
-          for (const call of calls) {
-            if (!checkActive(record)) return await settledView(record);
-            if (call.name === 'codex_tool') {
-              requests.push({ request_id: call.id, tool_name: call.args.name, arguments: call.args.arguments });
-            } else {
-              results.set(call.id, await localTool(record, call));
-            }
-          }
-          if (requests.length) {
-            // The host must be able to review the exact files before a brokered check.
-            record.artifacts = await collectArtifacts(record);
-            if (!checkActive(record)) return await settledView(record);
-            record.pending = { calls, results, requests };
-            record.state = 'waiting_for_tools';
-            return view(record);
-          }
-          for (const call of calls) record.messages.push(toolMessage(call.id, results.get(call.id)));
+          record.pending = { calls, results: new Map(), requests: [], counted: false };
           continue;
         }
         if (message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || message.tool_calls.length)) {
@@ -898,7 +955,7 @@ export function createAgentRuntime(options = {}) {
     alive();
     const input = validateStart(args);
     for (const record of records.values()) {
-      if (record.state === 'waiting_for_tools' && !record.busy && expired(record)) {
+      if (['waiting_for_tools', 'paused'].includes(record.state) && !record.busy && expired(record)) {
         markFailed(record, new AgentRuntimeError('deadline_exceeded', 'The agent time limit was reached.'));
         await finish(record);
       }
@@ -911,17 +968,19 @@ export function createAgentRuntime(options = {}) {
       if (!terminalId) fail('task_limit', 'The runtime has reached its task limit.');
       records.delete(terminalId);
     }
+    const startedAt = Date.now();
     const record = { id: randomUUID(), modelAlias: input.model, modelId: null,
-      state: 'running', startedAt: Date.now(), deadlineAt: Date.now() + input.totalTimeoutMs,
+      state: 'running', startedAt, deadlineAt: startedAt + input.totalTimeoutMs,
       totalTimeoutMs: input.totalTimeoutMs, finishedAt: null, finishing: null,
       maxSteps: input.maxSteps, maxToolCalls: input.maxToolCalls,
-      maxHttpAttempts: Math.min(18, input.maxSteps * 3), maxOutputTokens: input.maxOutputTokens,
+      maxHttpAttempts: Math.min(MAX_CUMULATIVE_HTTP_ATTEMPTS, input.maxSteps * 3), maxOutputTokens: input.maxOutputTokens,
       limits: LEGACY_LIMITS, maxResponseBytes: 4 * MiB, reasoningEffort: 'none',
       transportMode: 'json',
       steps: 0, toolCalls: 0, httpAttempts: 0, busy: true, cancelled: false,
       requestAbort: new AbortController(),
       seenCallIds: new Set(), pluginToolNames: new Set(input.pluginTools.map(item => item.name)),
       tools: null, baseline: new Map(), writtenArtifacts: new Map(), pending: null,
+      pauseReason: null, recoveryCount: 0, lastBudgetAddition: null,
       answer: null, artifacts: null, config: null, credential: null, messages: null, lastResponse: null,
       scratchDir: null, network: null };
     records.set(record.id, record);
@@ -1001,37 +1060,75 @@ export function createAgentRuntime(options = {}) {
     alive();
     if (!plain(args)) fail('invalid_argument', 'Invalid resume arguments.');
     const record = find(args.task_id);
-    if (record.state !== 'waiting_for_tools' || record.busy || !record.pending) {
-      fail('invalid_state', 'The task is not waiting for host tool results.');
+    const paused = record.state === 'paused';
+    if (record.busy || !paused && (record.state !== 'waiting_for_tools' || !record.pending)) {
+      fail('invalid_state', 'The task is not paused or waiting for host tool results.');
     }
-    if (!Array.isArray(args.results) || args.results.length !== record.pending.requests.length) {
-      fail('invalid_argument', 'All pending host tool results are required exactly once.');
-    }
-    const expected = new Set(record.pending.requests.map(item => item.request_id));
+    let plan;
     const encoded = new Map();
-    for (const item of args.results) {
-      if (!plain(item) || typeof item.request_id !== 'string' || !expected.has(item.request_id)
-          || encoded.has(item.request_id) || !Object.hasOwn(item, 'result')) {
-        fail('invalid_argument', 'A host tool result ID is unknown or duplicated.');
+    if (paused) {
+      if (args.results !== undefined && (!Array.isArray(args.results) || args.results.length)) {
+        fail('invalid_argument', 'Paused tasks do not accept host tool results.');
       }
-      encoded.set(item.request_id, safeJson(redactKnown(item.result, record.credential),
-        record.limits.toolResult, 'tool_result_invalid'));
+      const steps = boundedInteger(args.additional_steps, 'additional_steps', 0, 1, 12);
+      const tools = boundedInteger(args.additional_tool_calls, 'additional_tool_calls', 0, 1, 24);
+      const timeout = boundedInteger(args.extend_timeout_ms, 'extend_timeout_ms', 0, 1, 360_000);
+      if (record.pauseReason === 'step_limit' && !steps
+          || record.pauseReason === 'tool_limit' && !tools) {
+        fail('invalid_argument', 'Additional budget for the paused limit is required.');
+      }
+      if (record.maxSteps + steps > MAX_CUMULATIVE_STEPS
+          || record.maxToolCalls + tools > MAX_CUMULATIVE_TOOL_CALLS
+          || record.totalTimeoutMs + timeout > MAX_CUMULATIVE_TIMEOUT_MS) {
+        fail('invalid_argument', 'The cumulative recovery budget exceeds its hard limit.');
+      }
+      plan = { additional_steps: steps, additional_tool_calls: tools, extend_timeout_ms: timeout };
+    } else {
+      if (['additional_steps', 'additional_tool_calls', 'extend_timeout_ms']
+        .some(key => args[key] !== undefined)) {
+        fail('invalid_argument', 'Recovery budgets are accepted only while paused.');
+      }
+      if (!Array.isArray(args.results) || args.results.length !== record.pending.requests.length) {
+        fail('invalid_argument', 'All pending host tool results are required exactly once.');
+      }
+      const expected = new Set(record.pending.requests.map(item => item.request_id));
+      for (const item of args.results) {
+        if (!plain(item) || typeof item.request_id !== 'string' || !expected.has(item.request_id)
+            || encoded.has(item.request_id) || !Object.hasOwn(item, 'result')) {
+          fail('invalid_argument', 'A host tool result ID is unknown or duplicated.');
+        }
+        encoded.set(item.request_id, safeJson(redactKnown(item.result, record.credential),
+          record.limits.toolResult, 'tool_result_invalid'));
+      }
     }
+    // An expired checkpoint becomes a true terminal failure. Extension never
+    // gives an expired, cancelled or completed task a fresh deadline.
     if (expired(record)) {
       markFailed(record, new AgentRuntimeError('deadline_exceeded', 'The agent time limit was reached.'));
       return await settledView(record);
     }
-    const pending = record.pending;
     record.busy = true;
     let unbind;
     try {
       unbind = bindSignal(record, control);
-      if (record.cancelled) { markCancelled(record); return await settledView(record); }
-      for (const call of pending.calls) {
-        const content = pending.results.get(call.id) ?? encoded.get(call.id);
-        record.messages.push(toolMessage(call.id, content));
+      if (!checkActive(record)) return await settledView(record);
+      if (paused) {
+        record.maxSteps += plan.additional_steps;
+        record.maxToolCalls += plan.additional_tool_calls;
+        record.maxHttpAttempts = Math.min(MAX_CUMULATIVE_HTTP_ATTEMPTS, record.maxSteps * 3);
+        record.totalTimeoutMs += plan.extend_timeout_ms;
+        record.deadlineAt += plan.extend_timeout_ms;
+        record.recoveryCount += 1;
+        record.lastBudgetAddition = plan;
+      } else {
+        const pending = record.pending;
+        for (const call of pending.calls) {
+          const content = pending.results.get(call.id) ?? encoded.get(call.id);
+          record.messages.push(toolMessage(call.id, content));
+        }
+        record.pending = null;
       }
-      record.pending = null;
+      record.pauseReason = null;
       record.state = 'running';
       return await drive(record);
     } finally { record.busy = false; unbind?.(); }
@@ -1040,10 +1137,11 @@ export function createAgentRuntime(options = {}) {
   async function status(args) {
     alive();
     const record = find(args?.task_id);
-    if (record.state === 'waiting_for_tools' && expired(record)) {
+    if (['waiting_for_tools', 'paused'].includes(record.state) && expired(record)) {
       markFailed(record, new AgentRuntimeError('deadline_exceeded', 'The agent time limit was reached.'));
     }
     await finish(record);
+    if (record.state === 'paused') return view(record);
     return { ...metadata(record), ...(record.state === 'waiting_for_tools'
       ? { pending_requests: record.pending.requests.length } : {}),
     ...(record.state === 'failed' && record.network ? { network: record.network } : {}) };

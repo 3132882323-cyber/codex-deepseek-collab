@@ -8,7 +8,7 @@
 
 直接在当前 GPT 会话里描述任务。主控拆出双方各自的实质交付，让 Flash 在独立 scratch 完成代码、文档或资料整理；GPT 同时完成另一部分，并负责获授权的工具操作、整合与验收。Flash 需要插件时通过同一任务回传请求，GPT 实际执行后再提供必要结果。
 
-若 DeepSeek 工具调用会阻塞，使用已有授权内的唯一协调者维持该调用，其他 GPT 智能体继续工作。一次委派只提交一次，等待和部分产物沿同一任务处理；失败不自动重放，也不换模型。这是协作编排规则，不是把 Flash 注册到 GPT 的原生模型名单，更没有按 token 凑比例的自动配额。
+若 DeepSeek 工具调用会阻塞，使用已有授权内的唯一协调者维持该调用，其他 GPT 智能体继续工作。一次委派只创建一次任务：网络故障由客户端按已配置策略有限重试，步骤或工具额度用尽则沿同一任务断点续跑；不在外层反复 `start`，也不换模型。主控可事先规划最多两个有限恢复阶段，仍须检查剩余额度与期限。此协作方式不把 Flash 注册到 GPT 的原生模型名单，也没有按 token 凑比例的自动配额。
 
 ## 可选：Flash 单模型原生模式
 
@@ -25,6 +25,8 @@ node skills/deepseek-collaboration/scripts/install-native.mjs --codex-bin "C:/To
 桌面模式另提供 `Enable DeepSeek in Codex.cmd` 和 `Restore GPT in Codex.cmd`：使用 Codex 公共配置 API 保存并切换必要字段，恢复时检查这些字段是否又被用户修改。**桌面切换需要重启应用**，不能将 CLI profile 或模型目录解释为桌面聊天内的 provider 切换按钮。详见[原生接入、验收与限制](docs/native-codex.md)。
 
 GPT 父会话的自定义子智能体不能覆盖父 provider，所以这个模式不会把 Flash 自动加入 GPT `spawn_agent` 的跨服务商模型名单；需要 GPT 主控与 Flash 同时分工时，仍使用下面的 MCP 协作模式。
+
+0.7.0 的临时传输重试选项只用于 CLI/MCP 客户端；此可选原生守卫仍仅按既有明确 HTTP 状态策略重试，不继承该新选项。
 
 ## 用途与工作方式
 
@@ -48,13 +50,15 @@ DeepSeek 以外部 MCP 工作者运行；这不会把 DeepSeek 注册为 Codex �
 codex mcp add deepseek-agents -- node "<absolute-skill-directory>/scripts/deepseek-agent-mcp.mjs"
 ```
 
-MCP `tool_timeout_sec` 需覆盖任务上限：默认任务预算 360 秒时可配置为 420；增加任务预算时也要相应增加 MCP 超时。已打开的旧聊天未必热加载；连接或重启 MCP 后需确认 4 个工具出现。MCP server 不自行获取额外登录授权，直接网络仅有所配 DeepSeek API。项目不是基于 Harness SDK；此版本复用已有可靠 transport 为插件中转实现轻量 runtime，Harness 为可选完整 runtime 参考。
+MCP `tool_timeout_sec` 需覆盖允许的最长剩余任务期限：无续跑的默认 360 秒任务可配置为 420；允许累计 30 分钟恢复时可配置为 1860。已打开的旧聊天未必热加载；更新后重连 MCP，确认 continue 包含恢复额度参数。MCP server 不自行获取额外登录授权，直接网络仅有所配 DeepSeek API。项目不是基于 Harness SDK；此版本复用已有可靠 transport 为插件中转实现轻量 runtime，Harness 为可选完整 runtime 参考。
 
 [agent-jobs.json](examples/agent-jobs.json) 提供 Flash 清洗与证据整理的合成任务参数，首次显式选择 `max` 与 16384 生成预算，需先确认所选路由输出上限至少为 16384。让 Codex 读取其中各项 `arguments`，分别交给 `deepseek_agent_start`；它们可独立启动，返回的任务 ID 和工具请求须分别处理。参数是使用示例，不是执行记录。
 
 可按模型路由配置上下文、输出上限、视觉能力和默认思考强度。`default_reasoning_effort: "max"` 启用最高档；每次默认输出预算仍为 4096 tokens，长输出须明确提高。`images` 接收主控提供的图片 data URL，Flash 与 Pro 分别核对能力，不能因图片或失败自动换模型。旧配置沿用原有预算与关闭思考的默认行为。字段、图片协议及本地字节预算见[模型能力配置](docs/capabilities.md)。
 
 思考、答案与工具参数共享每轮生成预算。容量上限不会自动成为请求预算；`max` 配 4096 可能在答案开始前耗尽。首次提交应明确规划，小型独立任务可参考 16384、代码或多文件可参考 32768，均不保证足够。可选 `output_budget_policy` 在读取凭据和 HTTP 前拒绝过小的有效 `max` 请求，不暗中提高预算；未配置时保留旧默认，实际截断后也不自动扩容重发。见[共享输出预算](docs/output-budgets.md)。
+
+智能体首次默认最多 12 步、24 次工具调用，任务期限默认 360 秒。达到步骤或工具额度时返回 `state: "paused"`、`pause_reason`、产物哈希与 `recovery`；这不是完成或失败。主控检查 `can_resume`、剩余额度和期限后，在同一 MCP 进程用原 `task_id` 调用 `continue`，显式追加所需步骤或工具额度。每次最多追加 12 步、24 次工具调用及必要的 360 秒；累计硬上限为 48 步、96 工具、144 次 HTTP、从任务开始算 30 分钟。未执行的大批工具可分次补额度，额度足够前不执行也不重新 POST。已过期或真正终态不能复活，旧版本已清理的失败任务也不能事后恢复。详见[续跑接口](skills/deepseek-collaboration/references/agents.md)。
 
 参考：[Codex MCP 文档](https://learn.chatgpt.com/docs/extend/mcp) · [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
@@ -120,13 +124,19 @@ node skills/deepseek-collaboration/scripts/deepseek-client.mjs ask --prompt-file
 
 ## 调用可靠性
 
-默认 JSON 非流式；确认服务商支持后，可在 `connection.json` 设置 `"transport_mode": "sse"`，通过 SSE 接收并校验完整响应。CLI 与 MCP 仍在完整结束后返回结果。流式方式可能避免长期没有响应内容的等待，但不保证连接稳定，也不自动降级或重发。每次输出预算默认 4096 tokens、每次请求 180 秒、请求操作总预算 360 秒；thinking 从本地默认配置或显式任务参数读取，旧配置默认关闭。最多尝试 3 次（含首次），只重试明确收到的 HTTP `429/500/502/503/504`，采用有限指数退避和 jitter，并遵守 `Retry-After`；要求的等待超过上限或剩余预算时停止。
+默认 JSON 非流式；确认服务商支持后，可在 `connection.json` 设置 `"transport_mode": "sse"`，通过 SSE 接收并校验完整响应。CLI 与 MCP 仍在完整结束后返回结果，不自动降级。每次输出预算默认 4096 tokens，CLI 缺省单次请求 180 秒、请求操作总预算 360 秒；MCP 每个模型步骤同样最多单次 180 秒、含重试与退避共 360 秒，并受任务剩余期限约束。thinking 从本地默认配置或显式任务参数读取，旧配置默认关闭。
 
-超时、传输中断、HTTP 200 的损坏响应、空答案、输出截断均不自动重放；认证、参数、模型错误也停止。不叠加业务重试循环。中转错误可能发生在上游已经处理之后，HTTP 重试也可能额外计费；只允许一次提交时使用 `--max-attempts 1`。
+明确的 HTTP `429/500/502/503/504` 可按既有策略重试。使用者授权后，可将以下可选字段合并到 `connection.json`，为 CLI/MCP 额外启用白名单临时 socket、连接、reset 和本地超时重试；通用缺省为 `false`：
 
-客户端拒绝重定向，只向本地明确配置的 HTTPS origin 发送凭据。诊断文件设计为仅记录操作元数据，日志中的请求 ID 使用哈希；不记录提示词、答案、密钥或原始错误响应。诊断轮转为 best-effort，并发时可能丢失旧记录，不作为账单或完整审计记录。详见 [参数、错误与限制](docs/reliability.md)，完整参数可运行 `--help`。
+```json
+{"retry_policy":{"retry_transient_transport":true}}
+```
 
-智能体记录独立的 `agent_task` 终态，避免把某轮 HTTP 200 当作整任务完成。取消会阻止后续重试和工具操作，但不能撤销在途上游费用。失败时返回此前已成功写入且仍通过哈希核对的产物，主控可检查部分进度；这不代表任务成功，也不能跨 MCP 重启续接。
+两类故障共用最多 3 次尝试（含首次），采用有限退避，HTTP 仍尊重 `Retry-After`；等待超过上限或剩余预算时停止。不叠加业务重试循环。HTTP 200 的坏 JSON、干净结束但缺终止标记的 SSE、空答案、实际截断、认证、模型和参数错误仍不自动重放，不增加 token 预算或切换 Pro。网络断开可能发生在上游已处理之后，无法保证上游只执行或计费一次；只允许一次提交时使用 `--max-attempts 1`。
+
+客户端拒绝重定向，只向本地明确配置的 HTTPS origin 发送凭据。诊断文件设计为仅记录操作元数据，日志中的请求 ID 使用哈希；不记录提示词、答案、密钥或原始错误响应。诊断轮转为 best-effort，并发时可能丢失旧记录，不作为账单或完整审计记录。详见[参数、错误与限制](docs/reliability.md)和[恢复检查清单](docs/recovery-checklist.md)，完整参数可运行 `--help`。
+
+智能体只在真正终态记录一次 `agent_task`，暂停时保留进程内断点，不写终态日志。续跑不会重新派发已完成的文件工具或已回传的插件请求。取消会中断本地在途等待，并阻止后续重试和工具操作，但不能撤销上游处理或费用。暂停与失败时可检查此前已成功写入且仍通过哈希核对的产物；部分产物不代表成功，也不能跨 MCP 重启续接。
 
 ## 开发与验证
 

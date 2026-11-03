@@ -318,15 +318,15 @@ test('cancellation after dispatch prevents a late HTTP 503 from starting another
   const running = request(config, '/chat/completions', credential, body, policy, { signal: controller.signal });
   await begun;
   controller.abort(new Error(privateMarker));
-  assert.equal(fetchSignal.aborted, false, 'external cancellation does not claim to retract a dispatched request');
-  release(httpError());
+  assert.equal(fetchSignal.aborted, true, 'external cancellation stops local waiting without claiming to retract server work');
   await assert.rejects(running, error => {
     assert.equal(error.code, 'request_cancelled');
     assert.equal(error.metadata.attempts, 1);
-    assert.equal(error.metadata.http_status, 503);
+    assert.equal(error.metadata.http_status, null, 'headers that arrive after cancellation do not become a committed response');
     assert.equal(error.metadata.error_category, 'cancelled');
     return true;
   });
+  release(httpError());
   assert.equal(calls, 1);
 });
 
@@ -340,7 +340,7 @@ test('retry backoff is interruptible and removes its cancellation listener', { t
   t.mock.method(controller.signal, 'addEventListener', (name, listener, options) => {
     added++;
     addListener(name, listener, options);
-    queueMicrotask(() => controller.abort(new Error(privateMarker)));
+    if (added === 2) queueMicrotask(() => controller.abort(new Error(privateMarker)));
   });
   t.mock.method(controller.signal, 'removeEventListener', (name, listener) => {
     removed++;
@@ -357,8 +357,8 @@ test('retry backoff is interruptible and removes its cancellation listener', { t
     return true;
   });
   assert.equal(calls, 1);
-  assert.equal(added, 1);
-  assert.equal(removed, 1);
+  assert.equal(added, 2, 'the first listener covers the active request; the second covers retry backoff');
+  assert.equal(removed, 2);
   assert.ok(performance.now() - startedAt < 1500, 'cancellation must not wait out the >=2000ms backoff');
 });
 
@@ -432,8 +432,9 @@ test('production task diagnostics preserve only terminal enums, numeric budgets 
   const taskHash = 'sha256:0123456789abcdef';
   assert.equal(await recordDiagnostic(directory, 'agent_task', 'flash', {
     ok: false, state: 'failed', task_id_hash: taskHash, reasoning_effort: 'max',
-    total_timeout_ms: 360000, max_output_tokens: 4096, max_steps: 6, max_tool_calls: 12,
-    max_http_attempts: 18, steps: 2, tool_calls: 1, http_attempts: 2, artifact_count: 1,
+    total_timeout_ms: 1800000, max_output_tokens: 4096, max_steps: 48, max_tool_calls: 96,
+    max_http_attempts: 144, steps: 48, tool_calls: 96, http_attempts: 144, artifact_count: 1,
+    last_response:{step_index:48,finish_reason:'length',completion_tokens:4096,reasoning_tokens:4000},
     elapsed_ms: 32, error_code: 'answer_truncated', task_id: privateMarker,
     prompt: privateMarker, content: privateMarker, arguments: { key: credential }, path: directory,
     reasoning_content: privateMarker,
@@ -450,6 +451,11 @@ test('production task diagnostics preserve only terminal enums, numeric budgets 
   assert.equal(valid.max_output_tokens, 4096);
   assert.equal(valid.artifact_count, 1);
   assert.equal(valid.error_code, 'answer_truncated');
+  assert.equal(valid.total_timeout_ms,1800000);
+  assert.equal(valid.max_steps,48);assert.equal(valid.steps,48);
+  assert.equal(valid.max_tool_calls,96);assert.equal(valid.tool_calls,96);
+  assert.equal(valid.max_http_attempts,144);assert.equal(valid.http_attempts,144);
+  assert.equal(valid.last_response.step_index,48);
   assert.equal(valid.task_id, undefined);
   for (const field of ['model', 'state', 'task_id_hash', 'reasoning_effort', 'total_timeout_ms',
     'max_output_tokens', 'max_steps', 'error_code']) assert.equal(invalid[field], null);

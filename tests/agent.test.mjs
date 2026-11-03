@@ -351,14 +351,15 @@ for (const kind of ['symlink', 'hardlink']) {
 test('step budget is shared across broker continuation instead of resetting', async t => {
   const ctx = fixture(t, [broker()]);
   const waiting = await ctx.runtime.start(baseInput({ plugin_tools: [plugin], max_steps: 1 }));
-  const failed = isFailed(await ctx.runtime.resume({ task_id: waiting.task_id,
-    results: [{ request_id: waiting.requests[0].request_id, result: 'synthetic' }] }));
-  assert.equal(failed.error_code, 'step_limit');
+  const paused = await ctx.runtime.resume({ task_id: waiting.task_id,
+    results: [{ request_id: waiting.requests[0].request_id, result: 'synthetic' }] });
+  assert.equal(paused.state, 'paused');
+  assert.equal(paused.pause_reason, 'step_limit');
   assert.equal(ctx.calls.length, 1);
 });
 
 for (const code of ['request_failed', 'step_limit', 'answer_truncated']) {
-  test(`failed tasks preserve committed changed artifacts without changing ${code}`, async t => {
+  test(`stopped tasks preserve committed changed artifacts for ${code}`, async t => {
     const entries = [];
     const ctx = fixture(t, index => {
       if (index === 0) return toolResponse(
@@ -371,13 +372,20 @@ for (const code of ['request_failed', 'step_limit', 'answer_truncated']) {
     }, { recordDiagnostic: async (_stateDir, action, model, result) => {
       entries.push(structuredClone({ action, model, result }));
     } });
-    const failed = isFailed(await ctx.runtime.start(baseInput({
+    const failed = await ctx.runtime.start(baseInput({
       task: 'SYNTHETIC-PRIVATE-RECOVERY-TASK', reasoning_effort: 'max',
       max_steps: code === 'step_limit' ? 1 : 3,
       files: [{ path: 'input.txt', content: 'ORIGINAL-INPUT' },
         { path: 'untouched.txt', content: 'ORIGINAL-UNCHANGED' }],
-    })));
-    assert.equal(failed.error_code, code);
+    }));
+    if (code === 'step_limit') {
+      assert.equal(failed.state, 'paused');
+      assert.equal(failed.pause_reason, code);
+      assert.equal(failed.error_code, undefined);
+    } else {
+      isFailed(failed);
+      assert.equal(failed.error_code, code);
+    }
     assert.equal(failed.answer, undefined);
     assert.deepEqual(failed.artifacts, [
       { path: 'draft.txt', content: 'COMMITTED-NEW',
@@ -386,6 +394,16 @@ for (const code of ['request_failed', 'step_limit', 'answer_truncated']) {
         sha256: createHash('sha256').update('COMMITTED-CHANGED').digest('hex') },
     ]);
     const taskEntries = entries.filter(entry => entry.action === 'agent_task');
+    if (code === 'step_limit') {
+      assert.equal(taskEntries.length, 0, 'a resumable pause is not logged as terminal failure');
+      const status = await ctx.runtime.status({ task_id: failed.task_id });
+      assert.equal(status.state, 'paused');
+      assert.deepEqual(status.artifacts, failed.artifacts);
+      assert.ok(status.elapsed_ms >= failed.elapsed_ms);
+      assert.doesNotMatch(JSON.stringify(entries), /SYNTHETIC-PRIVATE-RECOVERY-TASK|COMMITTED-|ORIGINAL-|SYNTHETIC-HIDDEN-REASONING/);
+      assert.equal(ctx.calls.length, 1);
+      return;
+    }
     assert.equal(taskEntries.length, 1);
     const task = taskEntries[0].result;
     assert.deepEqual(Object.keys(task).sort(), ['ok', 'state', 'transport_mode', 'task_id_hash', 'reasoning_effort',
@@ -422,9 +440,10 @@ test('Windows artifact recovery matches committed paths across directory casing 
   for (const content of ['COMMITTED-CHANGED', 'ORIGINAL-INPUT']) {
     const ctx = fixture(t, [toolResponse(
       toolCall('call_write', 'write_file', { path: 'input/rows.txt', content }))]);
-    const failed = isFailed(await ctx.runtime.start(baseInput({ max_steps: 1,
-      files: [{ path: 'Input/rows.txt', content: 'ORIGINAL-INPUT' }] })));
-    assert.equal(failed.error_code, 'step_limit');
+    const failed = await ctx.runtime.start(baseInput({ max_steps: 1,
+      files: [{ path: 'Input/rows.txt', content: 'ORIGINAL-INPUT' }] }));
+    assert.equal(failed.state, 'paused');
+    assert.equal(failed.pause_reason, 'step_limit');
     assert.deepEqual(failed.artifacts, content === 'ORIGINAL-INPUT' ? [] : [{
       path: 'Input/rows.txt', content, sha256: createHash('sha256').update(content).digest('hex'),
     }]);
@@ -483,10 +502,13 @@ for (const finish of ['length', 'max_tokens', 'max_output_tokens']) {
   }
 }
 
-test('tool call budget rejects an entire over-budget batch before the first write', async t => {
+test('tool call budget pauses an entire over-budget batch before the first write', async t => {
   const ctx = fixture(t, [toolResponse(toolCall('call_one', 'write_file', { path: 'one.txt', content: 'one' }),
     toolCall('call_two', 'write_file', { path: 'two.txt', content: 'two' }))]);
-  assert.equal(isFailed(await ctx.runtime.start(baseInput({ max_tool_calls: 1 }))).error_code, 'tool_limit');
+  const paused = await ctx.runtime.start(baseInput({ max_tool_calls: 1 }));
+  assert.equal(paused.state, 'paused');
+  assert.equal(paused.pause_reason, 'tool_limit');
+  assert.equal(paused.recovery.pending_tool_calls, 2);
   assert.equal(collectFiles(ctx.scratchRoot).length, 0);
   assert.equal(ctx.calls.length, 1);
 });

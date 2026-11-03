@@ -44,7 +44,7 @@ async function main(){
   await mkdir(state,{recursive:true});
   const installedScripts=join(codexHome,'skills/deepseek-collaboration/scripts');await mkdir(installedScripts,{recursive:true});
   const source=dirname(fileURLToPath(import.meta.url));
-  for(const name of ['deepseek-native.mjs','deepseek-native-core.mjs','deepseek-native-tools.mjs','deepseek-native-launch.mjs','deepseek-native-desktop.mjs','install-native.mjs','deepseek-client.mjs','deepseek-budget.mjs','deepseek-stream.mjs']){
+  for(const name of ['deepseek-native.mjs','deepseek-native-core.mjs','deepseek-native-tools.mjs','deepseek-native-launch.mjs','deepseek-native-desktop.mjs','install-native.mjs','deepseek-client.mjs','deepseek-retry-policy.mjs','deepseek-budget.mjs','deepseek-stream.mjs']){
     const from=join(source,name),to=join(installedScripts,name);if(resolve(from)!==resolve(to))await copyFile(from,to);
   }
   const catalogPath=join(state,'models.json');
