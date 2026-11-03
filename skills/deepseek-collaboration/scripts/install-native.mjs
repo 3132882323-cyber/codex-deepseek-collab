@@ -44,8 +44,8 @@ async function main(){
   await mkdir(state,{recursive:true});
   const installedScripts=join(codexHome,'skills/deepseek-collaboration/scripts');await mkdir(installedScripts,{recursive:true});
   const source=dirname(fileURLToPath(import.meta.url));
-  for(const name of ['deepseek-native.mjs','deepseek-native-core.mjs','deepseek-native-tools.mjs','deepseek-native-launch.mjs','deepseek-native-desktop.mjs','install-native.mjs','deepseek-client.mjs','deepseek-retry-policy.mjs','deepseek-budget.mjs','deepseek-stream.mjs']){
-    const from=join(source,name),to=join(installedScripts,name);if(resolve(from)!==resolve(to))await copyFile(from,to);
+  for(const name of ['deepseek-native.mjs','deepseek-native-core.mjs','deepseek-native-tools.mjs','deepseek-native-launch.mjs','deepseek-native-desktop.mjs','install-native.mjs','deepseek-client.mjs','deepseek-retry-policy.mjs','deepseek-long-task-policy.mjs','deepseek-dispatcher.mjs','vendor/undici-agent.cjs','vendor/undici.LICENSE','vendor/undici.NOTICE.md','deepseek-budget.mjs','deepseek-stream.mjs']){
+    const from=join(source,name),to=join(installedScripts,name);if(resolve(from)!==resolve(to)){await mkdir(dirname(to),{recursive:true});await copyFile(from,to);}
   }
   const catalogPath=join(state,'models.json');
   const settings={version:1,connection_state_dir:connectionState,model:config.models.flash,port,planned_output_tokens:budget,context_window_tokens:cap.context_window_tokens};

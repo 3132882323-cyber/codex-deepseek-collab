@@ -150,9 +150,9 @@ test('MCP initializes, advertises exactly four tools, accepts initialized, and a
   }
   const continuation=listing.result.tools.find(tool=>tool.name==='deepseek_agent_continue').inputSchema;
   assert.deepEqual(continuation.required,['task_id']);
-  assert.equal(continuation.properties.additional_steps.maximum,12);
-  assert.equal(continuation.properties.additional_tool_calls.maximum,24);
-  assert.equal(continuation.properties.extend_timeout_ms.maximum,360000);
+  assert.equal(continuation.properties.additional_steps.maximum,4096);
+  assert.equal(continuation.properties.additional_tool_calls.maximum,16384);
+  assert.equal(continuation.properties.extend_timeout_ms.maximum,86400000);
   const ping = await connection.rpc('ping', undefined, 0);
   assert.equal(ping.id, 0);
   assert.deepEqual(ping.result, {});

@@ -7,6 +7,7 @@
   "credential_source": "env",
   "transport_mode": "json",
   "retry_policy": { "retry_transient_transport": false },
+  "long_task_policy": { "enabled": false },
   "default_reasoning_effort": "none",
   "capabilities": {
     "flash": {

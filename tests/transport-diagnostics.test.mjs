@@ -488,3 +488,18 @@ test('production step diagnostics whitelist finish reasons and token counts whil
   assert.equal(invalid.reasoning_tokens, null);
   assert.ok(!source.includes(privateMarker) && !source.includes(credential) && !source.includes(rawId));
 });
+
+test('long task diagnostics retain large safe counters and multi-day budgets without source content',async t=>{
+  const directory=fixture(t);
+  await recordDiagnostic(directory,'agent_task','flash',{ok:true,state:'completed',long_task_mode:true,
+    total_timeout_ms:259200000,request_timeout_ms:900000,request_total_timeout_ms:1800000,
+    max_steps:1001,max_tool_calls:7000,max_http_attempts:3003,steps:1001,tool_calls:7000,http_attempts:3003,
+    last_response:{step_index:1001,finish_reason:'stop',completion_tokens:100,reasoning_tokens:80},
+    prompt:privateMarker,reasoning_content:privateMarker});
+  const source=readFileSync(join(directory,'diagnostics.jsonl'),'utf8'),out=JSON.parse(source.trim());
+  assert.equal(out.long_task_mode,true);assert.equal(out.total_timeout_ms,259200000);
+  assert.equal(out.max_steps,1001);assert.equal(out.steps,1001);assert.equal(out.tool_calls,7000);
+  assert.equal(out.http_attempts,3003);assert.equal(out.last_response.step_index,1001);
+  assert.equal(out.request_timeout_ms,900000);assert.equal(out.request_total_timeout_ms,1800000);
+  assert.ok(!source.includes(privateMarker));
+});

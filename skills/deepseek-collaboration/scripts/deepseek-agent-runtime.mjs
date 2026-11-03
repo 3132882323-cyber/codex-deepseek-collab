@@ -1,4 +1,4 @@
-// A bounded, in-memory DeepSeek tool loop. Model-visible files live only in a
+// An in-memory DeepSeek tool loop with explicit phase budgets. Model-visible files live only in a
 // fresh scratch directory; Codex plugin calls are handed back to the host.
 import { constants } from 'node:fs';
 import { lstat, mkdir, mkdtemp, open, readdir, realpath, rename, unlink } from 'node:fs/promises';
@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { loadConfig, loadCredential, request, recordDiagnostic, safeTransportCode,
   safeStreamResponseReason, getModelCapabilities, getOutputBudgetPolicy, assessOutputBudget } from './deepseek-client.mjs';
+import { getLongTaskPolicy, resolveAgentBudgets } from './deepseek-long-task-policy.mjs';
 
 const KiB = 1024;
 const MiB = KiB * KiB;
@@ -336,10 +337,13 @@ function validateImages(value) {
 function validateStart(args) {
   if (!plain(args) || typeof args.task !== 'string' || !args.task.trim() || bytes(args.task) > EXTENDED_LIMITS.task
       || !['flash', 'pro'].includes(args.model)) fail('invalid_argument', 'A bounded task and model alias are required.');
-  const maxSteps = boundedInteger(args.max_steps, 'max_steps', 12, 1, 12);
-  const maxToolCalls = boundedInteger(args.max_tool_calls, 'max_tool_calls', 24, 1, 32);
-  const totalTimeoutMs = boundedInteger(args.total_timeout_ms, 'total_timeout_ms', 360_000, 1, 900_000);
-  const maxOutputTokens = boundedInteger(args.max_output_tokens, 'max_output_tokens', 4096, 32, MAX_OUTPUT_TOKENS);
+  // Validate the widest supported phase ranges here without assigning defaults.
+  // Configuration and the selected route decide the actual ranges and defaults
+  // before any credential is read or provider request is dispatched.
+  const maxSteps = boundedInteger(args.max_steps, 'max_steps', undefined, 1, 4096);
+  const maxToolCalls = boundedInteger(args.max_tool_calls, 'max_tool_calls', undefined, 1, 16384);
+  const totalTimeoutMs = boundedInteger(args.total_timeout_ms, 'total_timeout_ms', undefined, 1, 86_400_000);
+  const maxOutputTokens = boundedInteger(args.max_output_tokens, 'max_output_tokens', undefined, 32, MAX_OUTPUT_TOKENS);
   if (args.reasoning_effort !== undefined && !REASONING_EFFORTS.has(args.reasoning_effort)) {
     fail('invalid_argument', 'Invalid reasoning_effort.');
   }
@@ -572,19 +576,47 @@ function budgetExhaustion(record) {
   return response.reasoning_tokens === response.completion_tokens ? 'reasoning' : 'mixed';
 }
 function elapsed(record) { return Math.max(0, (record.finishedAt ?? Date.now()) - record.startedAt); }
+function longTaskMetadata(record) {
+  return record.longTaskMode ? { long_task_mode: true, unlimited_cumulative_budgets: true,
+    request_timeout_ms: record.requestTimeoutMs, request_total_timeout_ms: record.requestTotalTimeoutMs,
+    execution_slice_ms: record.executionSliceMs, total_timeout_ms: record.totalTimeoutMs } : {};
+}
 function metadata(record) {
   return { state: record.state, task_id: record.id, model: record.modelAlias,
     steps: record.steps, tool_calls: record.toolCalls, http_attempts: record.httpAttempts,
-    elapsed_ms: elapsed(record) };
+    elapsed_ms: elapsed(record), ...longTaskMetadata(record) };
+}
+function safeBudgetAddition(record, steps, tools, timeout) {
+  // Long tasks have no local cumulative quota. Integer precision still bounds
+  // counters and deadlines so additions cannot wrap or silently stop counting.
+  return Number.isSafeInteger(record.maxSteps + steps)
+    && Number.isSafeInteger((record.maxSteps + steps) * 3)
+    && Number.isSafeInteger(record.maxToolCalls + tools)
+    && Number.isSafeInteger(record.totalTimeoutMs + timeout)
+    && Number.isSafeInteger(record.deadlineAt + timeout)
+    && Number.isSafeInteger(record.recoveryCount + 1);
 }
 function recoveryMetadata(record) {
   const pendingCalls = record.pending?.calls.length ?? 0;
-  return {
-    same_process_only: true,
-    can_resume: record.pauseReason === 'step_limit'
+  const unlimited = record.unlimitedCumulativeBudgets;
+  const remainingTimeout = Math.max(0, record.deadlineAt - Date.now());
+  const deadlineExtension = unlimited && record.pauseReason === 'time_slice'
+    ? Math.max(0, record.requestTotalTimeoutMs - remainingTimeout) : 0;
+  const requiredTools = Math.max(1, record.toolCalls + pendingCalls - record.maxToolCalls);
+  const available = unlimited
+    ? record.pauseReason === 'time_slice'
+      ? safeBudgetAddition(record, 0, 0, deadlineExtension)
+      : record.pauseReason === 'step_limit'
+      ? safeBudgetAddition(record, 1, 0, 0)
+      : Number.isSafeInteger(record.toolCalls + pendingCalls)
+        && safeBudgetAddition(record, 0, requiredTools, 0)
+    : record.pauseReason === 'step_limit'
       ? record.maxSteps < MAX_CUMULATIVE_STEPS
       : record.toolCalls + pendingCalls <= MAX_CUMULATIVE_TOOL_CALLS
-        && record.maxToolCalls < MAX_CUMULATIVE_TOOL_CALLS,
+        && record.maxToolCalls < MAX_CUMULATIVE_TOOL_CALLS;
+  return {
+    same_process_only: true,
+    can_resume: available && !record.cancelled && !expired(record),
     resume_count: record.recoveryCount,
     budget_added: record.lastBudgetAddition !== null,
     last_budget_addition: record.lastBudgetAddition ? { ...record.lastBudgetAddition } : null,
@@ -593,10 +625,15 @@ function recoveryMetadata(record) {
     remaining_steps: Math.max(0, record.maxSteps - record.steps),
     remaining_tool_calls: Math.max(0, record.maxToolCalls - record.toolCalls),
     remaining_http_attempts: Math.max(0, record.maxHttpAttempts - record.httpAttempts),
-    remaining_timeout_ms: Math.max(0, record.deadlineAt - Date.now()),
-    additional_steps_available: MAX_CUMULATIVE_STEPS - record.maxSteps,
-    additional_tool_calls_available: MAX_CUMULATIVE_TOOL_CALLS - record.maxToolCalls,
-    extend_timeout_ms_available: MAX_CUMULATIVE_TIMEOUT_MS - record.totalTimeoutMs,
+    remaining_timeout_ms: remainingTimeout,
+    additional_steps_available: unlimited ? null : MAX_CUMULATIVE_STEPS - record.maxSteps,
+    additional_tool_calls_available: unlimited ? null : MAX_CUMULATIVE_TOOL_CALLS - record.maxToolCalls,
+    extend_timeout_ms_available: unlimited ? null : MAX_CUMULATIVE_TIMEOUT_MS - record.totalTimeoutMs,
+    ...(unlimited ? { unlimited_cumulative_budgets: true } : {}),
+    ...(record.pauseReason === 'time_slice' ? {
+      needs_deadline_extension: deadlineExtension > 0,
+      minimum_deadline_extension_ms: deadlineExtension,
+    } : {}),
     pending_tool_calls: pendingCalls,
   };
 }
@@ -634,7 +671,7 @@ function markCancelled(record) {
   record.messages = null;
   record.credential = null;
 }
-function expired(record) { return Date.now() >= record.deadlineAt; }
+function expired(record) { return record.deadlineAt !== null && Date.now() >= record.deadlineAt; }
 function checkActive(record) {
   if (record.cancelled) { markCancelled(record); return false; }
   if (expired(record)) { markFailed(record, new AgentRuntimeError('deadline_exceeded', 'The agent time limit was reached.')); return false; }
@@ -768,6 +805,7 @@ export function createAgentRuntime(options = {}) {
           task_id_hash: `sha256:${hash(record.id).slice(0, 16)}`,
           reasoning_effort: record.reasoningEffort, total_timeout_ms: record.totalTimeoutMs,
           max_output_tokens: record.maxOutputTokens, max_steps: record.maxSteps,
+          ...longTaskMetadata(record),
           minimum_output_tokens: record.outputBudget?.minimum_output_tokens ?? null,
           max_tool_calls: record.maxToolCalls, max_http_attempts: record.maxHttpAttempts,
           steps: record.steps, tool_calls: record.toolCalls, http_attempts: record.httpAttempts,
@@ -860,6 +898,8 @@ export function createAgentRuntime(options = {}) {
 
   async function drive(record) {
     record.busy = true;
+    const sliceDeadlineAt = Date.now() + record.executionSliceMs;
+    const initialSteps = record.steps;
     try {
       while (true) {
         if (!checkActive(record)) return await settledView(record);
@@ -871,8 +911,16 @@ export function createAgentRuntime(options = {}) {
         if (record.steps >= record.maxSteps) return await pause(record, 'step_limit');
         if (record.httpAttempts >= record.maxHttpAttempts) fail('http_attempt_limit', 'The HTTP attempt limit was reached.');
         const remaining = record.deadlineAt - Date.now();
-        const policy = { timeoutMs: Math.max(1, Math.min(180_000, remaining)),
-          totalTimeoutMs: Math.max(1, Math.min(360_000, remaining)),
+        // A cumulative task deadline may span many days. Yield a committed
+        // checkpoint while each individual host call still has time for a full
+        // provider step. The very first step retains explicit short deadlines.
+        if (record.longTaskMode && record.steps > 0
+            && (remaining < record.requestTotalTimeoutMs
+              || record.steps > initialSteps && sliceDeadlineAt - Date.now() < record.requestTotalTimeoutMs)) {
+          return await pause(record, 'time_slice');
+        }
+        const policy = { timeoutMs: Math.max(1, Math.min(record.requestTimeoutMs, remaining)),
+          totalTimeoutMs: Math.max(1, Math.min(record.requestTotalTimeoutMs, remaining)),
           maxAttempts: Math.min(3, record.maxHttpAttempts - record.httpAttempts),
           retryBaseMs: 1000, retryMaxMs: 10_000, maxResponseBytes: record.maxResponseBytes };
         const body = { model: record.modelId, messages: record.messages, tools: record.tools,
@@ -970,10 +1018,11 @@ export function createAgentRuntime(options = {}) {
     }
     const startedAt = Date.now();
     const record = { id: randomUUID(), modelAlias: input.model, modelId: null,
-      state: 'running', startedAt, deadlineAt: startedAt + input.totalTimeoutMs,
-      totalTimeoutMs: input.totalTimeoutMs, finishedAt: null, finishing: null,
-      maxSteps: input.maxSteps, maxToolCalls: input.maxToolCalls,
-      maxHttpAttempts: Math.min(MAX_CUMULATIVE_HTTP_ATTEMPTS, input.maxSteps * 3), maxOutputTokens: input.maxOutputTokens,
+      state: 'running', startedAt, deadlineAt: null,
+      totalTimeoutMs: null, finishedAt: null, finishing: null,
+      maxSteps: null, maxToolCalls: null, maxHttpAttempts: null, maxOutputTokens: input.maxOutputTokens ?? null,
+      longTaskMode: false, unlimitedCumulativeBudgets: false,
+      requestTimeoutMs: null, requestTotalTimeoutMs: null, executionSliceMs: null,
       limits: LEGACY_LIMITS, maxResponseBytes: 4 * MiB, reasoningEffort: 'none',
       transportMode: 'json',
       steps: 0, toolCalls: 0, httpAttempts: 0, busy: true, cancelled: false,
@@ -991,6 +1040,9 @@ export function createAgentRuntime(options = {}) {
       if (record.cancelled) { markCancelled(record); return await settledView(record); }
       record.config = await readConfig(stateDir);
       if (record.cancelled) { markCancelled(record); return await settledView(record); }
+      let longTaskPolicy;
+      try { longTaskPolicy = getLongTaskPolicy(record.config); }
+      catch { fail('configuration_invalid', 'The configured long-task policy is invalid.'); }
       record.transportMode = record.config?.transport_mode ?? 'json';
       if (!TRANSPORT_MODES.has(record.transportMode)) {
         record.transportMode = 'json';
@@ -1001,6 +1053,30 @@ export function createAgentRuntime(options = {}) {
         fail('model_unavailable', 'The requested model alias is not configured.');
       }
       const capabilities = getModelCapabilities(record.config, input.model);
+      let budgets;
+      try {
+        budgets = resolveAgentBudgets({ policy: longTaskPolicy,
+          routeMaxOutputTokens: capabilities.max_output_tokens,
+          maxOutputTokens: input.maxOutputTokens, maxSteps: input.maxSteps,
+          maxToolCalls: input.maxToolCalls, totalTimeoutMs: input.totalTimeoutMs });
+      } catch {
+        rejectedInput = true;
+        fail('invalid_argument', 'The agent budgets exceed the configured model or task policy.');
+      }
+      Object.assign(input, budgets);
+      record.longTaskMode = longTaskPolicy.enabled;
+      record.unlimitedCumulativeBudgets = budgets.unlimitedCumulativeBudgets;
+      record.maxSteps = budgets.maxSteps;
+      record.maxToolCalls = budgets.maxToolCalls;
+      record.maxHttpAttempts = budgets.unlimitedCumulativeBudgets ? budgets.maxSteps * 3
+        : Math.min(MAX_CUMULATIVE_HTTP_ATTEMPTS, budgets.maxSteps * 3);
+      record.maxOutputTokens = budgets.maxOutputTokens;
+      record.requestTimeoutMs = budgets.requestTimeoutMs;
+      record.requestTotalTimeoutMs = budgets.requestTotalTimeoutMs;
+      record.totalTimeoutMs = budgets.totalTimeoutMs;
+      record.deadlineAt = startedAt + budgets.totalTimeoutMs;
+      record.executionSliceMs = budgets.unlimitedCumulativeBudgets
+        ? Math.max(budgets.requestTotalTimeoutMs, Math.min(3_600_000, budgets.totalTimeoutMs)) : null;
       record.limits = capabilities.context_window_tokens === null ? LEGACY_LIMITS : EXTENDED_LIMITS;
       record.maxResponseBytes = capabilities.max_response_bytes;
       if (input.images.length && (!capabilities.vision.enabled
@@ -1070,17 +1146,24 @@ export function createAgentRuntime(options = {}) {
       if (args.results !== undefined && (!Array.isArray(args.results) || args.results.length)) {
         fail('invalid_argument', 'Paused tasks do not accept host tool results.');
       }
-      const steps = boundedInteger(args.additional_steps, 'additional_steps', 0, 1, 12);
-      const tools = boundedInteger(args.additional_tool_calls, 'additional_tool_calls', 0, 1, 24);
-      const timeout = boundedInteger(args.extend_timeout_ms, 'extend_timeout_ms', 0, 1, 360_000);
+      const unlimited = record.unlimitedCumulativeBudgets;
+      const steps = boundedInteger(args.additional_steps, 'additional_steps', 0, 1, unlimited ? 4096 : 12);
+      const tools = boundedInteger(args.additional_tool_calls, 'additional_tool_calls', 0, 1, unlimited ? 16384 : 24);
+      const timeout = boundedInteger(args.extend_timeout_ms, 'extend_timeout_ms', 0, 1, unlimited ? 86_400_000 : 360_000);
       if (record.pauseReason === 'step_limit' && !steps
           || record.pauseReason === 'tool_limit' && !tools) {
         fail('invalid_argument', 'Additional budget for the paused limit is required.');
       }
-      if (record.maxSteps + steps > MAX_CUMULATIVE_STEPS
+      if (record.pauseReason === 'time_slice' && !expired(record)
+          && record.deadlineAt + timeout - Date.now() < record.requestTotalTimeoutMs) {
+        fail('invalid_argument', 'The paused time slice requires a deadline extension for a full model step.');
+      }
+      if (unlimited ? !safeBudgetAddition(record, steps, tools, timeout)
+        : record.maxSteps + steps > MAX_CUMULATIVE_STEPS
           || record.maxToolCalls + tools > MAX_CUMULATIVE_TOOL_CALLS
           || record.totalTimeoutMs + timeout > MAX_CUMULATIVE_TIMEOUT_MS) {
-        fail('invalid_argument', 'The cumulative recovery budget exceeds its hard limit.');
+        fail('invalid_argument', unlimited ? 'The recovery budget exceeds safe integer precision.'
+          : 'The cumulative recovery budget exceeds its hard limit.');
       }
       plan = { additional_steps: steps, additional_tool_calls: tools, extend_timeout_ms: timeout };
     } else {
@@ -1115,7 +1198,8 @@ export function createAgentRuntime(options = {}) {
       if (paused) {
         record.maxSteps += plan.additional_steps;
         record.maxToolCalls += plan.additional_tool_calls;
-        record.maxHttpAttempts = Math.min(MAX_CUMULATIVE_HTTP_ATTEMPTS, record.maxSteps * 3);
+        record.maxHttpAttempts = record.unlimitedCumulativeBudgets ? record.maxSteps * 3
+          : Math.min(MAX_CUMULATIVE_HTTP_ATTEMPTS, record.maxSteps * 3);
         record.totalTimeoutMs += plan.extend_timeout_ms;
         record.deadlineAt += plan.extend_timeout_ms;
         record.recoveryCount += 1;

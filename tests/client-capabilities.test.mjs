@@ -125,3 +125,35 @@ test('CLI rejects impossible configured output/context limits before credential 
   assert.equal(failure(ctx.run([],{DEEPSEEK_API_KEY:''})).error_code,'configuration_invalid');
   assert.equal(ctx.requests().length,0);
 });
+
+test('CLI opted-in long mode uses the route ceiling and longer request budgets without credentials on dry-run',t=>{
+  const ctx=fixture(t);ctx.connection.long_task_policy={enabled:true};
+  ctx.connection.output_budget_policy={flash:{max_reasoning_min_output_tokens:16384}};ctx.save();
+  const out=success(ctx.run(['--dry-run'],{DEEPSEEK_API_KEY:''}));
+  assert.equal(out.long_task_mode,true);assert.equal(out.max_output_tokens,278528);
+  assert.equal(out.timeout_ms,900000);assert.equal(out.total_timeout_ms,1800000);
+  assert.equal(out.credential_decrypted,false);assert.equal(out.network_used,false);assert.equal(ctx.requests().length,0);
+  success(ctx.run());assert.equal(ctx.requests()[0].max_tokens,278528);
+});
+
+test('CLI long mode honors explicit output and timeout choices while preserving the route cap',t=>{
+  const ctx=fixture(t);ctx.connection.long_task_policy={enabled:true};ctx.save();
+  const out=success(ctx.run(['--max-output-tokens','32768','--timeout-ms','1200000','--total-timeout-ms','3600000','--dry-run'],{DEEPSEEK_API_KEY:''}));
+  assert.equal(out.max_output_tokens,32768);assert.equal(out.timeout_ms,1200000);assert.equal(out.total_timeout_ms,3600000);
+  assert.equal(failure(ctx.run(['--max-output-tokens','278529'],{DEEPSEEK_API_KEY:''})).error_code,'invalid_argument');
+  assert.equal(ctx.requests().length,0);
+});
+
+test('CLI validates long configuration before credentials and does not enable it implicitly',t=>{
+  const ctx=fixture(t);
+  for(const value of [null,{enabled:'yes'},{enabled:true,extra:'SYNTHETIC-PRIVATE'},{enabled:true,request_timeout_ms:2000,request_total_timeout_ms:1000}]){
+    ctx.connection.long_task_policy=value;ctx.save();
+    const out=failure(ctx.run([],{DEEPSEEK_API_KEY:''}));assert.equal(out.error_code,'configuration_invalid');
+    assert.ok(!JSON.stringify(out).includes('SYNTHETIC-PRIVATE'));
+  }
+  ctx.connection.long_task_policy={enabled:false};ctx.save();
+  assert.equal(failure(ctx.run(['--timeout-ms','900001'],{DEEPSEEK_API_KEY:''})).error_code,'invalid_argument');
+  const legacy=success(ctx.run(['--dry-run'],{DEEPSEEK_API_KEY:''}));
+  assert.equal(legacy.max_output_tokens,4096);assert.equal(legacy.timeout_ms,180000);assert.equal(legacy.total_timeout_ms,360000);
+  assert.equal(ctx.requests().length,0);
+});

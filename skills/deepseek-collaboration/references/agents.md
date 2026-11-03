@@ -1,5 +1,7 @@
 ## DeepSeek Agent 工具 API（参考）
 
+显式 `long_task_policy.enabled:true` 的默认额度、取消累计配额、`time_slice` 和延时续跑以[长任务说明](long-tasks.md)为准。下文 4096、12/24、48/96/144、30 分钟及最多两个恢复阶段均是未启用长模式时的兼容行为；接口和一次性工具授权在两种模式中相同。
+
 `deepseek_agent_start({task, model:'flash'|'pro', files?, images?, reasoning_effort?, plugin_tools?, max_steps?, max_tool_calls?, total_timeout_ms?, max_output_tokens?})` 创建任务并复制调用者明确提交的脱敏文件到新建 scratch。DeepSeek 内置工具 `list_files/read_file/write_file` 仅限该目录；不读任意工作区/凭据，不直接跑 shell。`codex_tool` 仅允许 parent 传入的 `plugin_tools` 名单。返回 `{state:'waiting_for_tools', task_id, requests:[{request_id, tool_name, arguments}]}` 时任务挂起。
 
 `reasoning_effort` 可为 `none/low/high/max`，缺省读取本地配置。`images` 为明确获准外发的图片 data URL 数组，只按所选路由声明的视觉能力接收；Pro 需额外明确验证。输出默认 4096，最大值取本地路由配置，未配置时最多 8192；绝对上限 393216。最高档工具循环会完整保留提供商要求的内部思考字段，但不向主控或日志暴露。

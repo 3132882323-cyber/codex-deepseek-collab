@@ -45,7 +45,7 @@ export async function readSettings(state){
 }
 export async function guardFingerprint(settings){
   const hash=createHash('sha256').update(JSON.stringify(settings));
-  for(const name of ['deepseek-native.mjs','deepseek-native-core.mjs','deepseek-native-tools.mjs','deepseek-client.mjs','deepseek-retry-policy.mjs','deepseek-budget.mjs','deepseek-stream.mjs'])hash.update(await readFile(new URL('./'+name,import.meta.url)));
+  for(const name of ['deepseek-native.mjs','deepseek-native-core.mjs','deepseek-native-tools.mjs','deepseek-client.mjs','deepseek-retry-policy.mjs','deepseek-long-task-policy.mjs','deepseek-dispatcher.mjs','vendor/undici-agent.cjs','deepseek-budget.mjs','deepseek-stream.mjs'])hash.update(await readFile(new URL('./'+name,import.meta.url)));
   return hash.digest('hex');
 }
 // Only validated terminal items become executable events. Untrusted intermediate

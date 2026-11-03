@@ -1,6 +1,6 @@
 {
   "name": "codex-deepseek-collab",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "description": "Same-chat GPT and DeepSeek Flash collaboration with bounded retries, progress checkpoints and host tool mediation.",
   "license": "MIT",
@@ -14,7 +14,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node tests/offline.test.mjs && node --test tests/agent.test.mjs tests/agent-recovery.test.mjs tests/retry-policy.test.mjs tests/client-recovery.test.mjs tests/mcp.test.mjs tests/capabilities.test.mjs tests/client-capabilities.test.mjs tests/transport-diagnostics.test.mjs tests/stream.test.mjs tests/budget.test.mjs tests/output-budget-integration.test.mjs tests/native-core.test.mjs tests/native-guard.test.mjs tests/native-tools.test.mjs",
+    "test": "node tests/offline.test.mjs && node --test tests/agent.test.mjs tests/agent-recovery.test.mjs tests/long-agent.test.mjs tests/long-task-policy.test.mjs tests/long-transport.test.mjs tests/retry-policy.test.mjs tests/client-recovery.test.mjs tests/mcp.test.mjs tests/capabilities.test.mjs tests/client-capabilities.test.mjs tests/transport-diagnostics.test.mjs tests/stream.test.mjs tests/budget.test.mjs tests/output-budget-integration.test.mjs tests/native-core.test.mjs tests/native-guard.test.mjs tests/native-tools.test.mjs",
     "check": "node scripts/check-syntax.mjs"
   },
   "files": [
@@ -24,6 +24,11 @@
     "skills/deepseek-collaboration/agents/openai.yaml",
     "skills/deepseek-collaboration/scripts/deepseek-client.mjs",
     "skills/deepseek-collaboration/scripts/deepseek-retry-policy.mjs",
+    "skills/deepseek-collaboration/scripts/deepseek-long-task-policy.mjs",
+    "skills/deepseek-collaboration/scripts/deepseek-dispatcher.mjs",
+    "skills/deepseek-collaboration/scripts/vendor/undici-agent.cjs",
+    "skills/deepseek-collaboration/scripts/vendor/undici.LICENSE",
+    "skills/deepseek-collaboration/scripts/vendor/undici.NOTICE.md",
     "skills/deepseek-collaboration/scripts/deepseek-budget.mjs",
     "skills/deepseek-collaboration/scripts/deepseek-native.mjs",
     "skills/deepseek-collaboration/scripts/deepseek-native-core.mjs",
@@ -36,6 +41,7 @@
     "skills/deepseek-collaboration/scripts/deepseek-agent-mcp.mjs",
     "skills/deepseek-collaboration/references/agents.md",
     "skills/deepseek-collaboration/references/output-budgets.md",
+    "skills/deepseek-collaboration/references/long-tasks.md",
     "skills/deepseek-collaboration/scripts/configure.mjs",
     "skills/deepseek-collaboration/scripts/configure-windows.ps1",
     "skills/deepseek-collaboration/references/connection.example.json",
@@ -43,6 +49,9 @@
     "tests/agent.test.mjs",
     "tests/agent-recovery.test.mjs",
     "tests/retry-policy.test.mjs",
+    "tests/long-task-policy.test.mjs",
+    "tests/long-agent.test.mjs",
+    "tests/long-transport.test.mjs",
     "tests/client-recovery.test.mjs",
     "tests/mcp.test.mjs",
     "tests/capabilities.test.mjs",
@@ -68,6 +77,7 @@
     "docs/recovery-checklist.md",
     "docs/native-codex.md",
     "docs/output-budgets.md",
+    "docs/long-tasks.md",
     "docs/capabilities.md",
     "docs/workflows.md",
     "LICENSE"

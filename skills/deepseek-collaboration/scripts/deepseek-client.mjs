@@ -10,6 +10,8 @@ import { fileURLToPath } from 'node:url';
 import { readChatCompletionStream, StreamResponseError, safeStreamResponseReason } from './deepseek-stream.mjs';
 import { assessOutputBudget } from './deepseek-budget.mjs';
 import { decideTransientRetry } from './deepseek-retry-policy.mjs';
+import { getLongTaskPolicy, resolveAgentBudgets } from './deepseek-long-task-policy.mjs';
+import { createLongTaskDispatcher } from './deepseek-dispatcher.mjs';
 
 const MAX_PROMPT_BYTES = 128 * 1024;
 const EXTENDED_MAX_PROMPT_BYTES = 2 * 1024 * 1024;
@@ -19,7 +21,8 @@ const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const EXTENDED_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 180_000;
 const DEFAULT_TOTAL_TIMEOUT_MS = 360_000;
-const MAX_TOTAL_TIMEOUT_MS = 900_000;
+const MAX_TOTAL_TIMEOUT_MS = 86_400_000;
+const LEGACY_MAX_TOTAL_TIMEOUT_MS = 900_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_BASE_MS = 1_000;
 const DEFAULT_RETRY_MAX_MS = 10_000;
@@ -145,6 +148,9 @@ function parseArguments(argv) {
     fail('invalid_argument', '--reasoning-effort must be none, low, high, or max.');
   }
   options.thinkingExplicit = provided.has('thinking');
+  options.maxOutputTokensExplicit = provided.has('maxOutputTokens');
+  options.timeoutMsExplicit = provided.has('timeoutMs');
+  options.totalTimeoutMsExplicit = provided.has('totalTimeoutMs');
   options.promptFile = resolve(options.promptFile);
   if (options.output) options.output = resolve(options.output);
   options.maxOutputTokens = parseInteger(String(options.maxOutputTokens), '--max-output-tokens', 32, ABSOLUTE_MAX_OUTPUT_TOKENS);
@@ -365,6 +371,7 @@ async function loadConfig(stateDir, optional = false) {
   const outputBudgetPolicy = parseOutputBudgetPolicy(raw.output_budget_policy,
     { models: raw.models, ...(capabilities === null ? {} : { capabilities }) });
   const retryPolicy = getRetryPolicy(raw);
+  const longTaskPolicy = validatedLongTaskPolicy(raw);
   base.pathname = base.pathname.replace(/\/+$/, '');
   return {
     base_url: base.href.replace(/\/$/, ''),
@@ -377,9 +384,15 @@ async function loadConfig(stateDir, optional = false) {
     ...(capabilities === null ? {} : { capabilities }),
     ...(outputBudgetPolicy === null ? {} : { output_budget_policy: outputBudgetPolicy }),
     ...(raw.retry_policy === undefined ? {} : { retry_policy: retryPolicy }),
+    ...(raw.long_task_policy === undefined ? {} : { long_task_policy: longTaskPolicy }),
     ...(raw.default_reasoning_effort === undefined ? {}
       : { default_reasoning_effort: raw.default_reasoning_effort }),
   };
+}
+
+function validatedLongTaskPolicy(config) {
+  try { return getLongTaskPolicy(config ?? {}); }
+  catch { fail('configuration_invalid', 'The long task policy is invalid.'); }
 }
 
 export function getRetryPolicy(config) {
@@ -628,6 +641,7 @@ function networkMetadata(startedAt, attempts, status, requestId, history, catego
 async function request(config, path, credential, body, policy, control = {}) {
   const startedAt = performance.now();
   const retryEnabled = getRetryPolicy(config).retry_transient_transport;
+  const longTaskPolicy = validatedLongTaskPolicy(config);
   if (!plainObject(control) || control.signal !== undefined
       && (typeof control.signal?.aborted !== 'boolean'
         || typeof control.signal.addEventListener !== 'function'
@@ -666,8 +680,9 @@ async function request(config, path, credential, body, policy, control = {}) {
     lastStatus = null;
     lastRequestId = null;
     const attemptTimeout = Math.max(1, Math.floor(Math.min(policy.timeoutMs, remaining)));
-    let response;
+    let response, transport;
     try {
+      if (longTaskPolicy.enabled) transport = createLongTaskDispatcher(attemptTimeout);
       const data = await withHardTimeout(async signal => {
         // The same approved origin is checked before every request; redirects remain manual.
         response = await fetch(target, {
@@ -676,6 +691,7 @@ async function request(config, path, credential, body, policy, control = {}) {
           body: payload,
           redirect: 'manual',
           signal,
+          ...(transport ? { dispatcher: transport.dispatcher } : {}),
         });
         if (signal.aborted) {
           cancelResponseBody(response);
@@ -786,6 +802,8 @@ async function request(config, path, credential, body, policy, control = {}) {
       throw new SafeError(isTimeout ? 'request_timeout' : 'request_failed',
         isTimeout ? 'The API request timed out; its outcome is unknown.'
           : 'The API request failed; its outcome is unknown.', undefined, metadata);
+    } finally {
+      transport?.dispose();
     }
   }
   // The loop always returns a response or throws a safe error.
@@ -989,7 +1007,7 @@ function diagnosticHistory(value) {
 
 function diagnosticLastResponse(value) {
   const get = key => ownDataValue(value, key);
-  const step = diagnosticCount(get('step_index'), null, 48);
+  const step = diagnosticCount(get('step_index'), null);
   if (!step) return null;
   return { step_index: step,
     finish_reason: diagnosticEnum(get('finish_reason'), DIAGNOSTIC_FINISH_REASONS),
@@ -1014,13 +1032,16 @@ function diagnosticEntry(action, model, result) {
     state: diagnosticEnum(get('state'), DIAGNOSTIC_TASK_STATES),
     task_id_hash: diagnosticRequestFingerprint(undefined, get('task_id_hash')),
     reasoning_effort: diagnosticEnum(get('reasoning_effort'), REASONING_EFFORTS),
-    total_timeout_ms: diagnosticCount(get('total_timeout_ms'), null, 1_800_000),
+    total_timeout_ms: diagnosticCount(get('total_timeout_ms'), null),
     max_output_tokens: diagnosticCount(get('max_output_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS),
-    max_steps: diagnosticCount(get('max_steps'), null, 48),
-    max_tool_calls: diagnosticCount(get('max_tool_calls'), null, 96),
-    max_http_attempts: diagnosticCount(get('max_http_attempts'), null, 144),
-    steps: diagnosticCount(get('steps'), 0, 48), tool_calls: diagnosticCount(get('tool_calls'), 0, 96),
-    http_attempts: diagnosticCount(get('http_attempts'), 0, 144),
+    max_steps: diagnosticCount(get('max_steps'), null, get('long_task_mode') === true ? Number.MAX_SAFE_INTEGER : 48),
+    max_tool_calls: diagnosticCount(get('max_tool_calls'), null, get('long_task_mode') === true ? Number.MAX_SAFE_INTEGER : 96),
+    max_http_attempts: diagnosticCount(get('max_http_attempts'), null, get('long_task_mode') === true ? Number.MAX_SAFE_INTEGER : 144),
+    steps: diagnosticCount(get('steps'), 0), tool_calls: diagnosticCount(get('tool_calls'), 0),
+    http_attempts: diagnosticCount(get('http_attempts'), 0),
+    ...(get('long_task_mode') === true ? { long_task_mode: true,
+      request_timeout_ms: diagnosticCount(get('request_timeout_ms'), null, MAX_TOTAL_TIMEOUT_MS),
+      request_total_timeout_ms: diagnosticCount(get('request_total_timeout_ms'), null, MAX_TOTAL_TIMEOUT_MS) } : {}),
     artifact_count: diagnosticCount(get('artifact_count'), 0, 128),
     minimum_output_tokens: diagnosticCount(get('minimum_output_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS),
     last_response: diagnosticLastResponse(get('last_response')),
@@ -1031,7 +1052,7 @@ function diagnosticEntry(action, model, result) {
   return { ...common,
     ...(action === 'agent_step' ? {
       task_id_hash: diagnosticRequestFingerprint(undefined, get('task_id_hash')),
-      step_index: diagnosticCount(get('step_index'), null, 48),
+      step_index: diagnosticCount(get('step_index'), null),
       max_output_tokens: diagnosticCount(get('max_output_tokens'), null, ABSOLUTE_MAX_OUTPUT_TOKENS),
       reasoning_effort: diagnosticEnum(get('reasoning_effort'), REASONING_EFFORTS),
     } : {}),
@@ -1113,6 +1134,7 @@ let safeOutputOptions = null;
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.help) {
+    process.stdout.write('An explicitly enabled long_task_policy overrides the legacy defaults below: omitted output tokens may use the configured route ceiling, request timeout defaults to 900000 ms and request-plus-backoff to 1800000 ms. Explicit flags take priority; time flags may reach 86400000 ms only in long mode. No cumulative token quota; provider/context limits and three total attempts still apply.\n\n');
     process.stdout.write('Usage:\n  deepseek-client.mjs [--state-dir PATH] status\n  deepseek-client.mjs [--state-dir PATH] models\n  deepseek-client.mjs [--state-dir PATH] ask --prompt-file PATH [--model flash|pro] [--thinking disabled|enabled] [--reasoning-effort none|low|high|max] [--max-output-tokens 32..393216] [--timeout-ms N] [--total-timeout-ms N] [--max-attempts 1..3] [--retry-base-ms 1..10000] [--retry-max-ms 1..60000] [--output PATH] [--dry-run]\n\nask defaults: thinking disabled, 4096 generated tokens, 180000 ms per attempt, 360000 ms total, 3 attempts, 1000..10000 ms bounded retry wait. Legacy configurations allow 8192 maximum output tokens and 128 KiB UTF-8 prompts; configured capabilities may raise these limits.\nExplicit HTTP 429/500/502/503/504 responses are retryable. Opt in to transient socket and local timeout retries with connection.json retry_policy.retry_transient_transport=true; they share the same attempt and time budgets. Invalid or truncated responses are never replayed. Provider work may already have run.\nstatus and --dry-run never decrypt credentials or use the network.\n--dry-run only prints metadata and never writes an --output target.\n');
     return;
   }
@@ -1142,6 +1164,7 @@ async function main() {
       default_reasoning_effort: config?.default_reasoning_effort ?? null,
       output_budget_policy: config?.output_budget_policy ?? null,
       retry_policy: getRetryPolicy(config),
+      long_task_policy: validatedLongTaskPolicy(config),
       network_used: false,
       credential_decrypted: false,
     }, options);
@@ -1168,7 +1191,19 @@ async function main() {
     && config.models.flash !== config.model ? 'pro' : 'flash');
   const profile = getModelCapabilities(config, modelAlias);
   const model = config.models[modelAlias];
-  const maxOutputTokens = options.maxOutputTokens;
+  const longPolicy = validatedLongTaskPolicy(config);
+  let maxOutputTokens;
+  try {
+    maxOutputTokens = resolveAgentBudgets({ policy: longPolicy,
+      routeMaxOutputTokens: profile.max_output_tokens,
+      ...(options.maxOutputTokensExplicit ? { maxOutputTokens: options.maxOutputTokens } : {}) }).maxOutputTokens;
+  } catch { fail('invalid_argument', 'The requested output budget exceeds the route or local argument limits.'); }
+  if (longPolicy.enabled) {
+    if (!options.timeoutMsExplicit) options.timeoutMs = longPolicy.request_timeout_ms;
+    if (!options.totalTimeoutMsExplicit) options.totalTimeoutMs = longPolicy.request_total_timeout_ms;
+  } else if (options.timeoutMs > LEGACY_MAX_TOTAL_TIMEOUT_MS || options.totalTimeoutMs > LEGACY_MAX_TOTAL_TIMEOUT_MS) {
+    fail('invalid_argument', 'The requested timeout requires long task mode.');
+  }
   if (maxOutputTokens > profile.max_output_tokens) {
     fail('invalid_argument', '--max-output-tokens exceeds the configured model limit.');
   }
@@ -1191,6 +1226,7 @@ async function main() {
       dry_run: true,
       transport_mode: config.transport_mode,
       retry_transient_transport: getRetryPolicy(config).retry_transient_transport,
+      long_task_mode: longPolicy.enabled,
       model_requested: model,
       prompt_bytes: buffer.byteLength,
       max_prompt_bytes: profile.max_prompt_bytes,

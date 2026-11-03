@@ -8,7 +8,7 @@
 
 直接在当前 GPT 会话里描述任务。主控拆出双方各自的实质交付，让 Flash 在独立 scratch 完成代码、文档或资料整理；GPT 同时完成另一部分，并负责获授权的工具操作、整合与验收。Flash 需要插件时通过同一任务回传请求，GPT 实际执行后再提供必要结果。
 
-若 DeepSeek 工具调用会阻塞，使用已有授权内的唯一协调者维持该调用，其他 GPT 智能体继续工作。一次委派只创建一次任务：网络故障由客户端按已配置策略有限重试，步骤或工具额度用尽则沿同一任务断点续跑；不在外层反复 `start`，也不换模型。主控可事先规划最多两个有限恢复阶段，仍须检查剩余额度与期限。此协作方式不把 Flash 注册到 GPT 的原生模型名单，也没有按 token 凑比例的自动配额。
+若 DeepSeek 工具调用会阻塞，使用已有授权内的唯一协调者维持该调用，其他 GPT 智能体继续工作。一次委派只创建一次任务：网络故障按客户端策略有限重试，暂停沿同一任务续跑，不在外层反复 `start` 或换模型。明确启用[长任务模式](docs/long-tasks.md)后，未指定的每轮生成预算取路由上限，不设本机累计 token、步骤、工具、HTTP 或恢复阶段配额；任务默认 2 小时，可沿检查点延时，单次请求默认 15 分钟。未启用时保留旧的有限模式。此协作方式不把 Flash 注册到 GPT 的原生模型名单。
 
 ## 可选：Flash 单模型原生模式
 
@@ -50,15 +50,15 @@ DeepSeek 以外部 MCP 工作者运行；这不会把 DeepSeek 注册为 Codex �
 codex mcp add deepseek-agents -- node "<absolute-skill-directory>/scripts/deepseek-agent-mcp.mjs"
 ```
 
-MCP `tool_timeout_sec` 需覆盖允许的最长剩余任务期限：无续跑的默认 360 秒任务可配置为 420；允许累计 30 分钟恢复时可配置为 1860。已打开的旧聊天未必热加载；更新后重连 MCP，确认 continue 包含恢复额度参数。MCP server 不自行获取额外登录授权，直接网络仅有所配 DeepSeek API。项目不是基于 Harness SDK；此版本复用已有可靠 transport 为插件中转实现轻量 runtime，Harness 为可选完整 runtime 参考。
+MCP `tool_timeout_sec` 须覆盖单次运行窗口：长模式可设 86460 秒，覆盖单次最大 24 小时窗口并留 60 秒；它通过 time_slice 分次交还控制。旧模式无恢复的 360 秒任务可设 420，允许累计 30 分钟可设 1860。更新后重连 MCP，确认当前聊天的工具说明已经更新。MCP server 不自行获取额外登录授权，直接网络仅有所配 DeepSeek API。
 
 [agent-jobs.json](examples/agent-jobs.json) 提供 Flash 清洗与证据整理的合成任务参数，首次显式选择 `max` 与 16384 生成预算，需先确认所选路由输出上限至少为 16384。让 Codex 读取其中各项 `arguments`，分别交给 `deepseek_agent_start`；它们可独立启动，返回的任务 ID 和工具请求须分别处理。参数是使用示例，不是执行记录。
 
-可按模型路由配置上下文、输出上限、视觉能力和默认思考强度。`default_reasoning_effort: "max"` 启用最高档；每次默认输出预算仍为 4096 tokens，长输出须明确提高。`images` 接收主控提供的图片 data URL，Flash 与 Pro 分别核对能力，不能因图片或失败自动换模型。旧配置沿用原有预算与关闭思考的默认行为。字段、图片协议及本地字节预算见[模型能力配置](docs/capabilities.md)。
+可按模型路由配置上下文、输出上限、视觉能力和默认思考强度。`default_reasoning_effort: "max"` 启用最高档；旧模式未指定预算为 4096，启用长模式并选择 route_max 后取本机声明的路由输出上限，显式值仍优先。`images` 接收主控提供的图片 data URL，按所选路由核对能力，不因图片或失败换模型。字段和本地字节预算见[模型能力配置](docs/capabilities.md)。
 
 思考、答案与工具参数共享每轮生成预算。容量上限不会自动成为请求预算；`max` 配 4096 可能在答案开始前耗尽。首次提交应明确规划，小型独立任务可参考 16384、代码或多文件可参考 32768，均不保证足够。可选 `output_budget_policy` 在读取凭据和 HTTP 前拒绝过小的有效 `max` 请求，不暗中提高预算；未配置时保留旧默认，实际截断后也不自动扩容重发。见[共享输出预算](docs/output-budgets.md)。
 
-智能体首次默认最多 12 步、24 次工具调用，任务期限默认 360 秒。达到步骤或工具额度时返回 `state: "paused"`、`pause_reason`、产物哈希与 `recovery`；这不是完成或失败。主控检查 `can_resume`、剩余额度和期限后，在同一 MCP 进程用原 `task_id` 调用 `continue`，显式追加所需步骤或工具额度。每次最多追加 12 步、24 次工具调用及必要的 360 秒；累计硬上限为 48 步、96 工具、144 次 HTTP、从任务开始算 30 分钟。未执行的大批工具可分次补额度，额度足够前不执行也不重新 POST。已过期或真正终态不能复活，旧版本已清理的失败任务也不能事后恢复。详见[续跑接口](skills/deepseek-collaboration/references/agents.md)。
+长模式首次默认 64 步、256 工具、2 小时，无固定累计循环或恢复次数配额；旧模式仍为 12/24/360 秒并受 48/96/144/30 分钟累计上限约束。步骤、工具达限或长模式 time_slice 会暂停并交付哈希产物，主控沿同一进程及任务 ID 继续，不重复已完成工具。未执行的大批次预算不足时保持暂停，不重新 POST。已过期、真正终态、旧版已清理现场或 MCP 重启后的任务不能复活。见[长任务说明](docs/long-tasks.md)和[续跑接口](skills/deepseek-collaboration/references/agents.md)。
 
 参考：[Codex MCP 文档](https://learn.chatgpt.com/docs/extend/mcp) · [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
@@ -153,7 +153,7 @@ npm test
 
 ## 参考与许可
 
-本项目代码与文档采用 [MIT](LICENSE)。协作规范和客户端由实际使用方案整理，未复制以下项目的实现，也不引入其运行时依赖：
+本项目自身代码与文档采用 [MIT](LICENSE)。长任务网络层随包分发固定版本 Undici Agent，原始许可和构建来源见 [vendor 说明](skills/deepseek-collaboration/scripts/vendor/undici.NOTICE.md)，运行时无需安装额外包。其余协作规范和客户端由实际使用方案整理；以下项目是相关参考：
 
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（MIT）：参考其[有限重试策略](https://github.com/deepseek-ai/deepseek-harness/blob/ce7073d51254c26cd63b22a60835b8f948deb447/packages/llm/llm/src/retry-policy.ts)及超时行为；本客户端使用独立实现的 JSON/SSE 传输和边界。
 - [Undici RetryHandler](https://github.com/nodejs/undici/blob/main/docs/docs/api/RetryHandler.md)（MIT）：重试与 `Retry-After` 的行为参考。

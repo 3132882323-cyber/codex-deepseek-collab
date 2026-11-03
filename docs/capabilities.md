@@ -33,7 +33,7 @@
 
 `default_reasoning_effort: "max"` 为本地默认。单个智能体任务可用 `reasoning_effort` 选择 `none`、`low`、`high` 或 `max`；CLI 对应 `--reasoning-effort max`。最高档发送 `thinking: {"type":"enabled"}` 与 `reasoning_effort: "max"`，`none` 关闭思考。显式 CLI `--thinking disabled` 可覆盖配置默认，同时指定矛盾的参数会在本地拒绝。[请求参数](https://api-docs.deepseek.com/api/create-chat-completion/)
 
-每次默认生成预算仍为 4096 tokens。长输出需要明确提高任务的 `max_output_tokens`，最多达到本地配置上限；增加预算不会保证生成同等数量。思考和最终内容共享生成预算，截断会报告失败，不自动重放。
+旧模式每次默认 4096 tokens；明确启用[长任务模式](long-tasks.md)并选择 route_max 后，未指定时使用本地配置的路由上限，不设累计 token 配额。显式 `max_output_tokens` 仍优先且受路由上限约束，预算不保证实际生成同等数量。思考和最终内容共享预算，截断会报告失败，不自动重放。
 
 工具循环会在提供商内部历史中保留 `reasoning_content` 以正确续接，不加入面向主控的答案、插件请求或诊断日志。[思考与工具调用规则](https://api-docs.deepseek.com/guides/thinking_mode/)
 
