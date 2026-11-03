@@ -5,6 +5,10 @@ description: Use DeepSeek Flash to offload substantial divisible work that can b
 
 # DeepSeek 智能体协作
 
+默认在同一个 GPT 主会话中协作：GPT 保持主控，通过已配置的 MCP 将独立实质任务交给 Flash，并继续完成自己的部分。用户要求“一起使用”或“同时干活”时，使用此工作方式，不切换主会话 provider，也不要求用户在 GPT 与 DeepSeek 两个单模型模式间切换。单模型原生 profile 是另行明确选择的可选功能。
+
+需要并行时，先划定双方交付，尽量重叠推进。若 start/continue 阻塞当前工具调用，可在已有多智能体授权内交给唯一协调者维持同一 DeepSeek 任务与 MCP 连接，主控及其他 GPT 智能体继续另一部分；不要重复提交委派，不要在不同 MCP 进程间接续旧任务。只有确实重叠执行才称“并行”。
+
 对可拆分的实质任务，按预计工作量与可验收交付，以 Codex GPT 和 DeepSeek 各承担约一半为目标。主控与全部 GPT 子智能体合算 Codex 一方；工具操作、应用、整合和验收也计入工作。双方都交付可用产物，不按 token、调用次数或智能体数量凑比例，不重复重做全部委派。保留用户已有的多智能体要求。
 
 调用前定义任务输入、输出与验收条件；仅复制获准外发的最小脱敏文件内容。准确模型来自本地 `models.flash` / `models.pro`，缺配置即停，不找别的密钥、网关或模型。详见 [智能体工具与插件中转](references/agents.md)。
